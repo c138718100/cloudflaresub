@@ -1,6 +1,6 @@
 #property strict
-#property version   "2.780"
-#property description "幽灵狙击手 - MT5黄金半自动交易与趋势过滤面板 v2.78 执行保护增强版"
+#property version   "2.790"
+#property description "幽灵狙击手 - MT5黄金半自动交易与趋势过滤面板 v2.79 执行保护增强版"
 
 #include <Trade/Trade.mqh>
 CTrade trade;
@@ -214,6 +214,12 @@ string PX="JGTM_";
 
 bool g_unifiedFollowActive=false;
 string g_unifiedFollowName="";
+
+// v2.79：统一TP/SL改为一次性异步提交，所有持仓几乎同时修改；服务器全部确认后再删辅助线。
+ulong  g_uniTickets[];
+int    g_uniPending=0,g_uniOk=0,g_uniFail=0,g_uniTarget=0;
+bool   g_uniBuy=true,g_uniHasTP=false,g_uniHasSL=false;
+ulong  g_uniStartMs=0;
 
 double g_lot=0.01;
 bool g_pause=false;
@@ -1061,6 +1067,23 @@ void LockStats(int &n,double &buyLots,double &sellLots,double &profit)
       profit+=PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);n++;
    }
 }
+// v2.79：本EA管理持仓全部打到止损/止盈时的金额（按价格计算，不含尚未发生的平仓佣金）
+void SLTPMoneySummary(double &slMoney,double &tpMoney,int &noSL,int &noTP)
+{
+   slMoney=tpMoney=0.0; noSL=noTP=0;
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong tk=PositionGetTicket(i);
+      if(!tk||!PositionSelectByTicket(tk)||!MatchPos())continue;
+      ENUM_ORDER_TYPE ot=((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY?ORDER_TYPE_BUY:ORDER_TYPE_SELL);
+      double v=PositionGetDouble(POSITION_VOLUME),op=PositionGetDouble(POSITION_PRICE_OPEN);
+      double psl=PositionGetDouble(POSITION_SL),ptp=PositionGetDouble(POSITION_TP);
+      double sw=PositionGetDouble(POSITION_SWAP),pl=0.0;
+      if(psl>0 && OrderCalcProfit(ot,_Symbol,v,op,psl,pl))slMoney+=pl+sw; else noSL++;
+      if(ptp>0 && OrderCalcProfit(ot,_Symbol,v,op,ptp,pl))tpMoney+=pl+sw; else noTP++;
+   }
+}
+
 double FloatPL(){int a,b;double l,p,av,l2,p2,av2;Stats(POSITION_TYPE_BUY,a,l,p,av);Stats(POSITION_TYPE_SELL,b,l2,p2,av2);return p+p2;}
 bool IsPendingType(ENUM_ORDER_TYPE x){return x==ORDER_TYPE_BUY_LIMIT||x==ORDER_TYPE_SELL_LIMIT||x==ORDER_TYPE_BUY_STOP||x==ORDER_TYPE_SELL_STOP||x==ORDER_TYPE_BUY_STOP_LIMIT||x==ORDER_TYPE_SELL_STOP_LIMIT;}
 int TotalManaged(){int n=0;for(int i=PositionsTotal()-1;i>=0;i--){ulong k=PositionGetTicket(i);if(k&&PositionSelectByTicket(k)&&MatchPos())n++;}for(int i=OrdersTotal()-1;i>=0;i--){ulong k=OrderGetTicket(i);if(k&&OrderSelect(k)&&MatchOrder()&&IsPendingType((ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE)))n++;}return n;}
@@ -2671,9 +2694,21 @@ void ApplyUnifiedTPSL(bool buy)
       return;
    }
 
+   if(g_uniPending>0)
+   {
+      g_status="上一轮统一TP/SL仍在等待服务器确认（"+IntegerToString(g_uniPending)+"笔），请稍候";
+      FastStatusUpdate();
+      return;
+   }
+
    ENUM_POSITION_TYPE wanted=(buy?POSITION_TYPE_BUY:POSITION_TYPE_SELL);
 
-   int target=0,ok=0,fail=0;
+   // 先收集目标仓位，再一次性异步发送：不再逐笔等待服务器回报（每笔约1秒），
+   // 10笔持仓也几乎同时完成修改。
+   ArrayResize(g_uniTickets,0);
+   int target=0,sent=0,localFail=0;
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetAsyncMode(true);
    for(int i=PositionsTotal()-1;i>=0;i--)
    {
       ulong tk=PositionGetTicket(i);
@@ -2681,16 +2716,21 @@ void ApplyUnifiedTPSL(bool buy)
       if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)!=wanted)continue;
 
       target++;
-
       double oldSL=PositionGetDouble(POSITION_SL);
       double oldTP=PositionGetDouble(POSITION_TP);
       double newSL=(hasSL?sl:oldSL);
       double newTP=(hasTP?tp:oldTP);
 
-      trade.SetExpertMagicNumber(MagicNumber);
-      if(trade.PositionModify(tk,newSL,newTP))ok++;
-      else fail++;
+      if(trade.PositionModify(tk,newSL,newTP))
+      {
+         int n=ArraySize(g_uniTickets);
+         ArrayResize(g_uniTickets,n+1);
+         g_uniTickets[n]=tk;
+         sent++;
+      }
+      else localFail++;
    }
+   trade.SetAsyncMode(false);
 
    if(target<=0)
    {
@@ -2699,23 +2739,61 @@ void ApplyUnifiedTPSL(bool buy)
       return;
    }
 
-   if(fail==0 && ok==target)
-   {
-      if(hasTP)ObjectDelete(0,tpName);
-      if(hasSL)ObjectDelete(0,slName);
-      ChartRedraw();
+   g_uniBuy=buy; g_uniHasTP=hasTP; g_uniHasSL=hasSL;
+   g_uniTarget=target; g_uniPending=sent; g_uniOk=0; g_uniFail=localFail;
+   g_uniStartMs=GetTickCount64();
 
+   if(sent<=0) { FinishUnifiedBatch(false); return; }
+   g_status="统一"+string(buy?"多":"空")+"：已同时提交"+IntegerToString(sent)+"笔修改，等待服务器确认…";
+   FastStatusUpdate();
+}
+
+// 全部回报到齐（或超时）后收尾：全部成功才删辅助线，否则保留便于重试。
+void FinishUnifiedBatch(bool timeout)
+{
+   string side=(g_uniBuy?"多":"空");
+   int unconfirmed=g_uniPending;
+   g_uniPending=0;
+   ArrayResize(g_uniTickets,0);
+
+   if(!timeout && g_uniFail==0 && g_uniOk==g_uniTarget)
+   {
+      if(g_uniHasTP)ObjectDelete(0,UnifiedLineName(g_uniBuy,true));
+      if(g_uniHasSL)ObjectDelete(0,UnifiedLineName(g_uniBuy,false));
       string scope=(UnifiedTPExcludeWelfare?"福利单默认排除":"福利单包含");
-      g_status="统一"+string(buy?"多":"空")+"TP/SL完成："+IntegerToString(ok)+"笔｜"+scope+"｜辅助线已消失";
+      g_status="统一"+side+"TP/SL完成："+IntegerToString(g_uniOk)+"笔｜"+scope+"｜用时"+
+               IntegerToString((int)(GetTickCount64()-g_uniStartMs))+"ms｜辅助线已消失";
    }
    else
    {
-      g_status="统一"+string(buy?"多":"空")+"部分完成：成功"+
-               IntegerToString(ok)+"/"+IntegerToString(target)+
-               "，失败"+IntegerToString(fail)+"｜辅助线保留";
+      g_status="统一"+side+"部分完成：成功"+IntegerToString(g_uniOk)+"/"+IntegerToString(g_uniTarget)+
+               "，失败"+IntegerToString(g_uniFail)+
+               (unconfirmed>0?"，未确认"+IntegerToString(unconfirmed):"")+"｜辅助线保留，可再次确认";
    }
-
    FastStatusUpdate();
+}
+
+// 在 OnTradeTransaction 里调用：匹配本轮统一修改的服务器回报
+void OnUnifiedModifyResult(const MqlTradeRequest &request,const MqlTradeResult &result)
+{
+   if(g_uniPending<=0 || request.action!=TRADE_ACTION_SLTP)return;
+   int n=ArraySize(g_uniTickets);
+   for(int i=0;i<n;i++)
+   {
+      if(g_uniTickets[i]!=request.position)continue;
+      g_uniTickets[i]=0;                       // 同一笔只计一次
+      g_uniPending--;
+      if(result.retcode==TRADE_RETCODE_DONE || result.retcode==TRADE_RETCODE_NO_CHANGES ||
+         result.retcode==TRADE_RETCODE_PLACED)
+         g_uniOk++;
+      else
+      {
+         g_uniFail++;
+         Print("统一TP/SL修改被拒｜ticket=",request.position," retcode=",result.retcode);
+      }
+      if(g_uniPending<=0)FinishUnifiedBatch(false);
+      return;
+   }
 }
 
 void SetAverageTP(ENUM_POSITION_TYPE ty)
@@ -3179,10 +3257,10 @@ void Draw()
  // 持仓统计展开高度约265px；折叠后保留36px标题栏，
  // 下方所有按钮整体上移229px，同时缩短主面板。
  int statShift=(g_statsCollapsed?-229:0);
- int panelH=1015+statShift;
+ int panelH=1035+statShift;
 
  Rect("BG",x,y,w,panelH,C'20,22,27');
- Txt("TITLE",x+10,y+7,"幽灵狙击手  MT5 v2.78 EXEC GUARD",11,C'255,210,40');
+ Txt("TITLE",x+10,y+7,"幽灵狙击手  MT5 v2.79 EXEC GUARD",11,C'255,210,40');
  Btn("HIDE",x+345,y+5,60,20,"隐藏 O",C'55,65,80');
  Txt("MODE",x+10,y+26,"Ghost Sniper · 黄金半自动交易/趋势过滤系统",8,C'210,210,210');
 
@@ -3433,7 +3511,7 @@ void Draw()
  Btn("LOCK",x+145,y+812+sy,125,26,"🔒 一键锁仓",C'80,55,125');
  Btn("UNLOCK",x+280,y+812+sy,125,26,"解锁",C'55,90,125');
 
- Rect("INFO",x+10,y+845+sy,395,108,C'28,32,38');
+ Rect("INFO",x+10,y+845+sy,395,128,C'28,32,38');
  Txt("I1",x+20,y+855+sy,
      "余额 "+DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE),2)+
      "   净值 "+DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY),2),
@@ -3459,10 +3537,19 @@ void Draw()
  UpdateLatencyText();
  Txt("I5",x+20,y+935+sy,g_latencyText,7,g_latencyColor);
 
- Txt("KEY",x+10,y+966+sy,
+ double slMoney=0,tpMoney=0; int noSL=0,noTP=0;
+ SLTPMoneySummary(slMoney,tpMoney,noSL,noTP);
+ Txt("I6",x+20,y+955+sy,
+     "全部打止损 "+(slMoney>=0?"+":"")+DoubleToString(slMoney,2)+
+     "  全部打止盈 "+(tpMoney>=0?"+":"")+DoubleToString(tpMoney,2)+" USD"+
+     (noSL>0?"｜无SL "+IntegerToString(noSL)+"笔":"")+
+     (noTP>0?"｜无TP "+IntegerToString(noTP)+"笔":""),
+     8,(noSL>0?C'255,150,70':C'240,200,120'));
+
+ Txt("KEY",x+10,y+986+sy,
      "小键盘: 7狙击多 8排单多 9平多 | 1狙击空 2排单空 3平空 | 4平浮盈 5推保 6平浮亏",
      7,C'170,180,190');
- Txt("KEY2",x+10,y+984+sy,
+ Txt("KEY2",x+10,y+1004+sy,
      "0紧急全平(按两次) | .删除挂单 | 空格暂停 | +/-手数 | O隐藏",
      7,C'170,180,190');
 
@@ -3680,7 +3767,7 @@ int OnInit()
 
  ChartSetInteger(0,CHART_EVENT_MOUSE_MOVE,true);
  EventSetMillisecondTimer(MathMax(250,PanelRefreshMs));
- g_status="幽灵狙击手 v2.78 就绪｜过滤周期 "+EnumToString(FilterTF(PERIOD_M5))+"｜佣金自学习+动态滑点缓冲+保护修改重试";
+ g_status="幽灵狙击手 v2.79 就绪｜过滤周期 "+EnumToString(FilterTF(PERIOD_M5))+"｜佣金自学习+动态滑点缓冲+保护修改重试";
  Draw();return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason)
@@ -3703,6 +3790,9 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
                         const MqlTradeResult &result)
 {
+   if(trans.type==TRADE_TRANSACTION_REQUEST)
+      OnUnifiedModifyResult(request,result);
+
    // 任意新增成交都可能改变实际Commission/Fee，先失效成本缓存。
    if(trans.type==TRADE_TRANSACTION_DEAL_ADD)
    {
@@ -3784,6 +3874,9 @@ void OnTick()
 
 void OnTimer()
 {
+   // 统一TP/SL超过5秒仍有未回报的，按未确认收尾，避免一直卡在等待状态。
+   if(g_uniPending>0 && GetTickCount64()-g_uniStartMs>5000)FinishUnifiedBatch(true);
+
    RefreshCommissionLearning(false);
    RefreshAnalysisCache(false);
    Draw();
