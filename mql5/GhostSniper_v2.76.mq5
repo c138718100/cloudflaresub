@@ -1,6 +1,6 @@
 #property strict
-#property version   "2.800"
-#property description "幽灵狙击手 - MT5黄金半自动交易与趋势过滤面板 v2.80 执行保护增强版"
+#property version   "2.810"
+#property description "幽灵狙击手 - MT5黄金半自动交易与趋势过滤面板 v2.81 自动参数版"
 
 #include <Trade/Trade.mqh>
 CTrade trade;
@@ -169,6 +169,26 @@ input int          AverageTPOffsetPts   = 100; // 均价TP偏移(Points)
 input bool         EnableUnifiedTP       = true; // 启用“TP→均价±”功能
 input bool         UnifiedTPExcludeWelfare = true; // 统一TP默认排除福利单；锁仓单始终排除
 
+input group "=== v2.81 自动参数（按品种波动/点差自动计算） ==="
+input bool   EnableAutoParams      = true;  // 启动时开启自动参数（面板“自动参数”按钮可随时开关）
+input double AutoSLATRH1           = 1.0;   // 止损 = H1 ATR × 此倍数
+input double AutoTPScalp           = 0.40;  // 抢钱：首级止盈 = M5 ATR × 此倍数
+input double AutoTPSniper          = 0.67;  // 狙击：首级止盈 = M15 ATR × 此倍数
+input double AutoGapScalp          = 0.40;  // 抢钱：排单间距/偏移 = M5 ATR × 此倍数
+input double AutoGapSniper         = 0.45;  // 狙击：排单间距/偏移 = M15 ATR × 此倍数
+input double AutoMinTPCost         = 3.0;   // 止盈至少 = 单次交易成本(点差+佣金) × 此倍数
+input double AutoBE                = 0.60;  // 推保本触发 = 基准ATR × 此倍数（抢钱基准=M5，狙击基准=M15×0.92）
+input double AutoBEPlus            = 0.12;  // 保本加点 = 基准ATR × 此倍数
+input double AutoTrailStart        = 1.20;  // 追踪启动 = 基准ATR × 此倍数
+input double AutoTrailDist         = 1.00;  // 追踪距离 = 基准ATR × 此倍数
+input double AutoTrailStep         = 0.32;  // 追踪步距 = 基准ATR × 此倍数
+input double AutoWelfareStart      = 1.30;  // 福利单跟踪启动 = M15 ATR × 此倍数
+input double AutoWelfareDist       = 0.78;  // 福利单跟踪距离 = M15 ATR × 此倍数
+input double AutoWelfareStep       = 0.22;  // 福利单跟踪步距 = M15 ATR × 此倍数
+input double AutoSpreadMultiple    = 3.0;   // 最大允许点差 = 近期点差中位数 × 此倍数
+input bool   AutoLotByRisk         = false; // 按风险自动算手数（一批单全部止损 ≈ 净值 × 下方%）
+input double RiskPercentPerBatch   = 0.5;   // 每批（单数 × 手数）全部打止损的风险占净值%
+
 input group "=== 快捷键设置 ==="
 input bool         EnableKeyboard       = true; // 启用键盘快捷键
 input bool         EnableNumPad         = true; // 启用小键盘数字快捷键
@@ -278,6 +298,15 @@ int g_welfareTPPts=10000;
 int g_welfareLayer=0; // 0=自动中间层
 int g_maxTotalOrders=15;   // v2.80：面板可改的总单数上限（启动时取参数 MaxTotalOrders）
 double g_maxSideLots=1.0;  // v2.80：面板可改的单边手数上限（0=不限，启动时取参数 MaxSideLots）
+// v2.81：保护参数改为运行时变量（自动参数会实时更新；关闭自动时取输入参数）
+int g_beTrig=100,g_bePlus=30,g_trailTrig=300,g_trailDist=200,g_trailStep=50;
+int g_wTrailStart=600,g_wTrailDist=350,g_wTrailStep=100,g_maxSpread=120;
+bool g_autoParams=true;
+bool g_autoReady=false;
+datetime g_autoLastBar=0;
+string g_autoInfo="自动参数：等待数据";
+int hAtrM5=INVALID_HANDLE,hAtrM15=INVALID_HANDLE,hAtrH1=INVALID_HANDLE;
+int g_sprBuf[256]; int g_sprN=0,g_sprPos=0;
 int hRSI=INVALID_HANDLE;
 int hADX=INVALID_HANDLE;
 int hBands15=INVALID_HANDLE,hBands25=INVALID_HANDLE,hKCEMA=INVALID_HANDLE,hKCATR=INVALID_HANDLE;
@@ -981,7 +1010,7 @@ bool TradeOK()
 {
    if(g_pause){g_status="快捷交易已暂停";return false;}
    MqlTick t;if(!SymbolInfoTick(_Symbol,t))return false;
-   if((t.ask-t.bid)/_Point>MaxSpreadPoints){g_status="点差过大，拒绝下单";return false;}
+   if((t.ask-t.bid)/_Point>g_maxSpread){g_status="点差过大，拒绝下单";return false;}
    return true;
 }
 void Stats(ENUM_POSITION_TYPE ty,int &n,double &lots,double &profit,double &avg)
@@ -1046,7 +1075,7 @@ void WelfareStatsDetailed(ENUM_POSITION_TYPE ty,int &n,double &lots,double &prof
       double cp=PositionCostPoints();
       double mpp=MoneyPerPointPerLot()*v;
       double pp=(mpp>0?MathMax(0.0,WelfareProtectedProfitUSD)/mpp:0.0);
-      double basePts=cp+MathMax(0,BreakEvenPlusPts);
+      double basePts=cp+MathMax(0,g_bePlus);
       double be=(ty==POSITION_TYPE_BUY?open+basePts*_Point:open-basePts*_Point);
       double fl=(ty==POSITION_TYPE_BUY?open+(basePts+pp)*_Point:open-(basePts+pp)*_Point);
       n++;lots+=v;profit+=PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);
@@ -2419,13 +2448,13 @@ int ProtectGroupAtAverage(ENUM_POSITION_TYPE ty,int &skipped)
    skipped=0;
    int count=0;double lots=0,avg=0,costPts=0,cur=0,netPts=0;
    if(!GroupProtectionData(ty,count,lots,avg,costPts,cur,netPts))return 0;
-   if(netPts<BreakEvenTriggerPts){skipped=count;return 0;}
+   if(netPts<g_beTrig){skipped=count;return 0;}
 
    long stops=(long)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL);
    long freeze=(long)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_FREEZE_LEVEL);
    double minGap=(MathMax((double)stops,(double)freeze)+BreakEvenSafetyPts)*_Point;
-   double groupSL=(ty==POSITION_TYPE_BUY ? avg+(costPts+BreakEvenPlusPts)*_Point
-                                         : avg-(costPts+BreakEvenPlusPts)*_Point);
+   double groupSL=(ty==POSITION_TYPE_BUY ? avg+(costPts+g_bePlus)*_Point
+                                         : avg-(costPts+g_bePlus)*_Point);
    groupSL=NormalizeDouble(groupSL,_Digits);
 
    if((ty==POSITION_TYPE_BUY && cur-groupSL<minGap) ||
@@ -2471,10 +2500,10 @@ void AutoProtect()
       ENUM_POSITION_TYPE ty=(side==0?POSITION_TYPE_BUY:POSITION_TYPE_SELL);
       int count=0;double lots=0,avg=0,costPts=0,cur=0,netPts=0;
       if(!GroupProtectionData(ty,count,lots,avg,costPts,cur,netPts))continue;
-      if(netPts<TrailTriggerPts)continue;
+      if(netPts<g_trailTrig)continue;
 
-      double groupFloor=(ty==POSITION_TYPE_BUY ? avg+(costPts+BreakEvenPlusPts)*_Point
-                                               : avg-(costPts+BreakEvenPlusPts)*_Point);
+      double groupFloor=(ty==POSITION_TYPE_BUY ? avg+(costPts+g_bePlus)*_Point
+                                               : avg-(costPts+g_bePlus)*_Point);
       long stops=(long)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL);
       long freeze=(long)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_FREEZE_LEVEL);
       double minGap=(MathMax((double)stops,(double)freeze)+BreakEvenSafetyPts)*_Point;
@@ -2485,13 +2514,13 @@ void AutoProtect()
          if(!tk||!PositionSelectByTicket(tk)||!IsNormalManagedPositionSelected())continue;
          if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)!=ty)continue;
          double sl=PositionGetDouble(POSITION_SL),tp=PositionGetDouble(POSITION_TP);
-         double tr=(ty==POSITION_TYPE_BUY ? cur-TrailDistancePts*_Point
-                                          : cur+TrailDistancePts*_Point);
+         double tr=(ty==POSITION_TYPE_BUY ? cur-g_trailDist*_Point
+                                          : cur+g_trailDist*_Point);
          if(ty==POSITION_TYPE_BUY)tr=MathMax(tr,groupFloor);else tr=MathMin(tr,groupFloor);
          tr=NormalizeDouble(tr,_Digits);
          bool safe=(ty==POSITION_TYPE_BUY ? cur-tr>=minGap : tr-cur>=minGap);
-         bool stepOK=(ty==POSITION_TYPE_BUY ? (sl==0||tr>sl+TrailStepPts*_Point)
-                                            : (sl==0||tr<sl-TrailStepPts*_Point));
+         bool stepOK=(ty==POSITION_TYPE_BUY ? (sl==0||tr>sl+g_trailStep*_Point)
+                                            : (sl==0||tr<sl-g_trailStep*_Point));
          if(safe&&stepOK)ResilientPositionModify(tk,tr,tp,"普通追踪");
       }
    }
@@ -2867,9 +2896,9 @@ bool IsWelfarePosition()
 // 3) TP继续保留，先到TP则TP平仓；先回调触发跟踪SL则保护出场。
 void WelfareTrailing()
 {
-   int startPts=MathMax(1,WelfareTrailStartPts);
-   int distancePts=MathMax(1,WelfareTrailDistancePts);
-   int stepPts=MathMax(1,WelfareTrailStepPts);
+   int startPts=MathMax(1,g_wTrailStart);
+   int distancePts=MathMax(1,g_wTrailDist);
+   int stepPts=MathMax(1,g_wTrailStep);
    MqlTick tick;if(!SymbolInfoTick(_Symbol,tick))return;
    long stopLevel=(long)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL);
    long freezeLevel=(long)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_FREEZE_LEVEL);
@@ -2891,7 +2920,7 @@ void WelfareTrailing()
       double costPts=PositionCostPoints();
       double mpp=MoneyPerPointPerLot()*vol;
       double protectPts=(mpp>0?MathMax(0.0,WelfareProtectedProfitUSD)/mpp:0.0);
-      double basePts=costPts+MathMax(0,BreakEvenPlusPts);
+      double basePts=costPts+MathMax(0,g_bePlus);
       double floor=(pt==POSITION_TYPE_BUY ? open+(basePts+protectPts)*_Point
                                           : open-(basePts+protectPts)*_Point);
       double trigger=(pt==POSITION_TYPE_BUY ? floor+startPts*_Point
@@ -3090,6 +3119,9 @@ void ApplyEdit(string key,string text)
  StringTrimLeft(text);StringTrimRight(text);
  double d=StringToDouble(text);
  int v=(int)MathRound(d);
+ bool manualCore=(key=="SLV"||key=="TPV"||key=="OFV"||key=="GPV");
+ bool autoTurnedOff=(manualCore && g_autoParams);
+ if(autoTurnedOff) g_autoParams=false;   // 手动改核心参数 → 自动参数关闭，不再被覆盖
 
  if(key=="SLV"){g_slPts=MathMax(0,v);g_status="止损距离已改为 "+IntegerToString(g_slPts)+" 点";}
  else if(key=="TPV"){g_tpPts=MathMax(1,v);g_status="止盈点数已改为 "+IntegerToString(g_tpPts)+" 点";}
@@ -3108,6 +3140,7 @@ void ApplyEdit(string key,string text)
     g_welfareLayer=(v<=0?0:MathMax(2,MathMin(10,v)));
     g_status=(g_welfareLayer==0?"福利单层级：自动中间层":"福利单层级：第"+IntegerToString(g_welfareLayer)+"层");
  }
+ if(autoTurnedOff) g_status+="（自动参数已关闭，改为手动）";
  Draw();
 }
 double CurrentATRValue()
@@ -3265,10 +3298,10 @@ void Draw()
  // 持仓统计展开高度约265px；折叠后保留36px标题栏，
  // 下方所有按钮整体上移229px，同时缩短主面板。
  int statShift=(g_statsCollapsed?-229:0);
- int panelH=1035+statShift;
+ int panelH=1055+statShift;
 
  Rect("BG",x,y,w,panelH,C'20,22,27');
- Txt("TITLE",x+10,y+7,"幽灵狙击手  MT5 v2.80 EXEC GUARD",11,C'255,210,40');
+ Txt("TITLE",x+10,y+7,"幽灵狙击手  MT5 v2.81 AUTO ADAPT",11,C'255,210,40');
  Btn("HIDE",x+345,y+5,60,20,"隐藏 O",C'55,65,80');
  Txt("MODE",x+10,y+26,"Ghost Sniper · 黄金半自动交易/趋势过滤系统",8,C'210,210,210');
 
@@ -3278,6 +3311,7 @@ void Draw()
  Txt("LOT",x+10,y+69,"手数  "+DoubleToString(g_lot,2),9);
  Btn("LM",x+125,y+65,45,22,"-手",C'80,80,90');
  Btn("LP",x+175,y+65,45,22,"+手",C'80,80,90');
+ Btn("AUTO",x+230,y+65,175,22,g_autoParams?"自动参数 ● 开":"自动参数 ○ 关(手动)",g_autoParams?C'0,110,120':C'85,85,85');
 
  Btn("B7",x+10,y+94,125,29,"▲ 狙击多 [7]",C'0,120,35');
  Btn("B8",x+145,y+94,125,29,"▲ 排单多 [8]",C'0,105,75');
@@ -3522,7 +3556,7 @@ void Draw()
  Btn("LOCK",x+145,y+812+sy,125,26,"🔒 一键锁仓",C'80,55,125');
  Btn("UNLOCK",x+280,y+812+sy,125,26,"解锁",C'55,90,125');
 
- Rect("INFO",x+10,y+845+sy,395,128,C'28,32,38');
+ Rect("INFO",x+10,y+845+sy,395,148,C'28,32,38');
  Txt("I1",x+20,y+855+sy,
      "余额 "+DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE),2)+
      "   净值 "+DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY),2),
@@ -3557,10 +3591,12 @@ void Draw()
      (noTP>0?"｜无TP "+IntegerToString(noTP)+"笔":""),
      8,(noSL>0?C'255,150,70':C'240,200,120'));
 
- Txt("KEY",x+10,y+986+sy,
+ Txt("I7",x+20,y+975+sy,g_autoParams?g_autoInfo:"自动参数已关闭：使用面板/输入参数",7,g_autoParams?C'110,210,255':C'150,150,160');
+
+ Txt("KEY",x+10,y+1006+sy,
      "小键盘: 7狙击多 8排单多 9平多 | 1狙击空 2排单空 3平空 | 4平浮盈 5推保 6平浮亏",
      7,C'170,180,190');
- Txt("KEY2",x+10,y+1004+sy,
+ Txt("KEY2",x+10,y+1024+sy,
      "0紧急全平(按两次) | .删除挂单 | 空格暂停 | +/-手数 | O隐藏",
      7,C'170,180,190');
 
@@ -3599,6 +3635,18 @@ void Action(string a)
  }
  else if(a=="SHORT"){g_shortMode=true;g_tpPts=ShortTPPoints;g_gapPts=ShortLadderGap;g_offsetPts=ShortLadderOffset;g_status="已切换抢钱模式并载入抢钱参数";}
  else if(a=="LONG"){g_shortMode=false;g_tpPts=LongTPPoints;g_gapPts=LongLadderGap;g_offsetPts=LongLadderOffset;g_status="已切换狙击模式并载入狙击参数";}
+ else if(a=="AUTO")
+ {
+   g_autoParams=!g_autoParams;
+   if(g_autoParams){ RecalcAutoParams(true); g_status="自动参数已开启：按本品种ATR与点差实时计算"; }
+   else
+   {
+      // 关闭自动：保护参数回到输入值，止损/止盈/间距保持当前数值，可在面板手动改
+      g_beTrig=BreakEvenTriggerPts;g_bePlus=BreakEvenPlusPts;g_trailTrig=TrailTriggerPts;g_trailDist=TrailDistancePts;g_trailStep=TrailStepPts;
+      g_wTrailStart=WelfareTrailStartPts;g_wTrailDist=WelfareTrailDistancePts;g_wTrailStep=WelfareTrailStepPts;g_maxSpread=MaxSpreadPoints;
+      g_status="自动参数已关闭：保护参数恢复为输入值";
+   }
+ }
  else if(a=="B7"){Market(ORDER_TYPE_BUY);lightOnly=true;}
  else if(a=="B8"){Ladder(ORDER_TYPE_BUY);lightOnly=true;}
  else if(a=="B9"){CloseSide(POSITION_TYPE_BUY);lightOnly=true;}
@@ -3657,6 +3705,7 @@ void Action(string a)
    lightOnly=true;
  }
 
+ if((a=="SHORT"||a=="LONG") && g_autoParams){ RecalcAutoParams(true); g_status+="（自动参数已按新模式重算）"; }
  if(lightOnly)FastStatusUpdate();
  else Draw();
 }
@@ -3765,6 +3814,10 @@ int OnInit()
  g_offsetPts=(g_shortMode?ShortLadderOffset:LongLadderOffset); if(g_offsetPts<0)g_offsetPts=LadderOffsetPoints;
  g_orderCount=MathMax(1,MathMin(10,LadderOrders));g_welfareTPPts=WelfareTPPoints;g_welfareLayer=WelfareLayer;
  g_maxTotalOrders=MathMax(1,MaxTotalOrders);g_maxSideLots=MathMax(0.0,MaxSideLots);
+ g_beTrig=BreakEvenTriggerPts;g_bePlus=BreakEvenPlusPts;g_trailTrig=TrailTriggerPts;g_trailDist=TrailDistancePts;g_trailStep=TrailStepPts;
+ g_wTrailStart=WelfareTrailStartPts;g_wTrailDist=WelfareTrailDistancePts;g_wTrailStep=WelfareTrailStepPts;g_maxSpread=MaxSpreadPoints;
+ g_autoParams=EnableAutoParams;g_autoReady=false;g_sprN=0;g_sprPos=0;
+ hAtrM5=iATR(_Symbol,PERIOD_M5,14);hAtrM15=iATR(_Symbol,PERIOD_M15,14);hAtrH1=iATR(_Symbol,PERIOD_H1,14);
  g_welfareEnabled=EnableWelfareOrder;g_steppedTP=EnableSteppedTP;g_floatTriggerPct=FloatProfitPct;g_panelHidden=false;
  hRSI=iRSI(_Symbol,FilterTF(PERIOD_M5),RSIPeriod,PRICE_CLOSE);
  hADX=iADX(_Symbol,FilterTF(ADXTimeframe),ADXPeriod);
@@ -3779,7 +3832,7 @@ int OnInit()
 
  ChartSetInteger(0,CHART_EVENT_MOUSE_MOVE,true);
  EventSetMillisecondTimer(MathMax(250,PanelRefreshMs));
- g_status="幽灵狙击手 v2.80 就绪｜过滤周期 "+EnumToString(FilterTF(PERIOD_M5))+"｜佣金自学习+动态滑点缓冲+保护修改重试";
+ g_status="幽灵狙击手 v2.81 就绪｜过滤周期 "+EnumToString(FilterTF(PERIOD_M5))+"｜佣金自学习+动态滑点缓冲+保护修改重试";
  Draw();return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason)
@@ -3792,6 +3845,9 @@ void OnDeinit(const int reason)
  if(hBands25!=INVALID_HANDLE)IndicatorRelease(hBands25);
  if(hKCEMA!=INVALID_HANDLE)IndicatorRelease(hKCEMA);
  if(hKCATR!=INVALID_HANDLE)IndicatorRelease(hKCATR);
+ if(hAtrM5!=INVALID_HANDLE)IndicatorRelease(hAtrM5);
+ if(hAtrM15!=INVALID_HANDLE)IndicatorRelease(hAtrM15);
+ if(hAtrH1!=INVALID_HANDLE)IndicatorRelease(hAtrH1);
  ObjectsDeleteAll(0,PX);
  ObjectDelete(0,OBJ_UNI_BUY_TP);
  ObjectDelete(0,OBJ_UNI_BUY_SL);
@@ -3860,6 +3916,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 
 void OnTick()
 {
+   SampleSpread();
    // 账户/方向亏损保护保持最高优先级：每个Tick都检查。
    SideProtection();
 
@@ -3884,8 +3941,107 @@ void OnTick()
    }
 }
 
+//---------------- v2.81 自动参数 ----------------
+string SymbolClassText()
+{
+   string s=_Symbol; StringToUpper(s);
+   if(StringFind(s,"XAU")>=0 || StringFind(s,"GOLD")>=0) return "黄金";
+   if(StringFind(s,"XAG")>=0 || StringFind(s,"SILVER")>=0) return "白银";
+   if(StringFind(s,"XTI")>=0 || StringFind(s,"XBR")>=0 || StringFind(s,"OIL")>=0 || StringFind(s,"WTI")>=0 || StringFind(s,"BRENT")>=0) return "原油";
+   if(StringFind(s,"BTC")>=0 || StringFind(s,"ETH")>=0) return "加密";
+   if(StringFind(s,"US30")>=0 || StringFind(s,"US500")>=0 || StringFind(s,"USTEC")>=0 || StringFind(s,"NAS")>=0 ||
+      StringFind(s,"SPX")>=0 || StringFind(s,"DJ")>=0 || StringFind(s,"GER")>=0 || StringFind(s,"DAX")>=0) return "指数";
+   return "外汇/其它";
+}
+
+double AtrPts(int h)
+{
+   if(h==INVALID_HANDLE || _Point<=0) return 0.0;
+   double a[]; ArraySetAsSeries(a,true);
+   if(CopyBuffer(h,0,1,1,a)<1) return 0.0;
+   return a[0]/_Point;
+}
+
+void SampleSpread()
+{
+   MqlTick t; if(!SymbolInfoTick(_Symbol,t) || _Point<=0) return;
+   g_sprBuf[g_sprPos]=(int)MathRound((t.ask-t.bid)/_Point);
+   g_sprPos=(g_sprPos+1)%256; if(g_sprN<256) g_sprN++;
+}
+
+// 近期点差中位数：实时采样（最多256个报价）与最近一天M5K线记录取较大者
+double MedianSpreadPts()
+{
+   double live=0.0;
+   if(g_sprN>=20)
+   {
+      int a[]; ArrayResize(a,g_sprN);
+      for(int i=0;i<g_sprN;i++) a[i]=g_sprBuf[i];
+      ArraySort(a); live=a[g_sprN/2];
+   }
+   int sp[]; double hist=0.0;
+   if(CopySpread(_Symbol,PERIOD_M5,1,288,sp)>=20) { ArraySort(sp); hist=sp[ArraySize(sp)/2]; }
+   double cur=CurrentSpreadPoints();
+   double m=MathMax(live,hist);
+   return m>0 ? m : cur;
+}
+
+void RecalcAutoParams(bool force)
+{
+   if(!g_autoParams) return;
+   datetime bar=iTime(_Symbol,PERIOD_M5,0);
+   if(!force && g_autoReady && bar==g_autoLastBar) return;
+
+   double a5=AtrPts(hAtrM5), a15=AtrPts(hAtrM15), a60=AtrPts(hAtrH1);
+   if(a5<=0 || a15<=0 || a60<=0) { g_autoInfo="自动参数：ATR数据未就绪，暂用当前参数"; return; }
+   g_autoLastBar=bar; g_autoReady=true;
+
+   double spr=MedianSpreadPts();
+   double mpp=MoneyPerPointPerLot();
+   double commPts=(mpp>0 ? MathMax(CommissionPerLotRT,(g_learnedEntryCostPerLot+g_learnedExitCostPerLot))/mpp : 0.0);
+   double cost=spr+commPts;
+   bool sc=g_shortMode;
+   double base=sc ? a5 : a15*0.92;
+   long stops=(long)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL);
+   long freeze=(long)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_FREEZE_LEVEL);
+   double minDist=(double)MathMax(stops,freeze)+5;
+
+   int tp=(int)MathRound(MathMax((sc?a5*AutoTPScalp:a15*AutoTPSniper),MathMax(cost*AutoMinTPCost,minDist)));
+   int gap=(int)MathRound(MathMax((sc?a5*AutoGapScalp:a15*AutoGapSniper),MathMax(spr*2.0,minDist)));
+   int sl=(int)MathRound(MathMax(a60*AutoSLATRH1,MathMax(tp*2.0,minDist*3)));
+
+   g_tpPts=tp; g_gapPts=gap; g_offsetPts=gap; g_slPts=sl;
+   g_beTrig   =(int)MathRound(MathMax(base*AutoBE,cost*2.0));
+   g_bePlus   =(int)MathRound(MathMax(base*AutoBEPlus,spr*0.5));
+   g_trailTrig=(int)MathRound(MathMax(base*AutoTrailStart,g_beTrig*1.5));
+   g_trailDist=(int)MathRound(MathMax(base*AutoTrailDist,MathMax(spr*2.0,minDist)));
+   g_trailStep=(int)MathRound(MathMax(base*AutoTrailStep,spr*0.5));
+   g_wTrailStart=(int)MathRound(a15*AutoWelfareStart);
+   g_wTrailDist =(int)MathRound(MathMax(a15*AutoWelfareDist,spr*2.0));
+   g_wTrailStep =(int)MathRound(MathMax(a15*AutoWelfareStep,spr*0.5));
+   g_maxSpread  =(int)MathRound(MathMax(spr*AutoSpreadMultiple,spr+10));
+
+   string lotTxt="";
+   if(AutoLotByRisk && mpp>0)
+   {
+      double riskMoney=AccountInfoDouble(ACCOUNT_EQUITY)*MathMax(0.0,RiskPercentPerBatch)/100.0;
+      double perOrder=riskMoney/MathMax(1,g_orderCount);
+      double perLot=sl*mpp+MathMax(0.0,CommissionPerLotRT);
+      double st=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP), mn=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+      if(st<=0) st=0.01;
+      double lot=MathFloor(perOrder/perLot/st+1e-8)*st;
+      if(lot<mn) { lot=mn; lotTxt="｜风险预算不足最小手数，按最小手"; }
+      g_lot=NLot(lot);
+      lotTxt=StringFormat("｜手数 %.2f(风险%.1f%%=$%.0f)",g_lot,RiskPercentPerBatch,riskMoney)+lotTxt;
+   }
+
+   g_autoInfo=StringFormat("自动[%s·%s] ATR5/15/60 %.0f/%.0f/%.0f 点差%.0f｜SL%d TP%d 距%d｜保本%d 追%d/%d%s",
+                           SymbolClassText(),sc?"抢钱":"狙击",a5,a15,a60,spr,sl,tp,gap,g_beTrig,g_trailTrig,g_trailDist,lotTxt);
+}
+
 void OnTimer()
 {
+   RecalcAutoParams(false);
    // 统一TP/SL超过5秒仍有未回报的，按未确认收尾，避免一直卡在等待状态。
    if(g_uniPending>0 && GetTickCount64()-g_uniStartMs>5000)FinishUnifiedBatch(true);
 
