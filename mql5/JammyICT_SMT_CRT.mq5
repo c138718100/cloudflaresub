@@ -4,8 +4,8 @@
 //| 每根新K线重算一次（只用已收盘K线，不重绘），全部用图形对象绘制。       |
 //+------------------------------------------------------------------+
 #property copyright "Jammy"
-#property version   "1.10"
-#property description "Jammy ICT Suite v1.10：SMT / 结构(BOS·CHoCH) / FVG / OB / 流动性 / 折价溢价·OTE / Killzone / CRT"
+#property version   "1.20"
+#property description "Jammy ICT Suite v1.20：SMT / 结构(BOS·CHoCH) / FVG / OB / 流动性 / 折价溢价·OTE / Killzone / CRT"
 #property indicator_chart_window
 #property indicator_buffers 0
 #property indicator_plots   0
@@ -26,7 +26,9 @@ input string SMTCandidates       = "XAGUSD,DXY,USDX,EURUSD,XPTUSD,US500"; // 当
 input int    CorrBars            = 120;   // 相关系数回看K线数（收益率相关）
 input double MinAbsCorr          = 0.50;  // |相关系数| 至少多少才判 SMT
 input bool   SMTGroupIgnoreCorr  = false; // 固定配对时不看相关系数门槛
-input int    SMTMaxPairs         = 6;     // 最多回看多少组相邻波段
+input int    SMTMaxPairs         = 6;     // 检查最近多少个波段点
+input int    SMTSwingDepth       = 6;     // 每个新波段点往前最多对比几个旧波段（不限于相邻）
+input int    SMTOtherWindow      = 6;     // 对比品种取极值的时间窗口（±K线数）
 
 input group "=== 市场结构 ==="
 input bool   ShowStructure       = true;
@@ -618,11 +620,28 @@ bool OtherExtreme(string sym,datetime t,bool wantHigh,double &v)
 {
    int sh=iBarShift(sym,_Period,t,false);
    if(sh<0) return false;
-   int from=MathMax(0,sh-SwingLen), cnt=2*SwingLen+1;
+   int w=MathMax(SwingLen,SMTOtherWindow);   // 两个品种的极值常差几根K线，窗口放宽
+   int from=MathMax(0,sh-w), cnt=2*w+1;
    int k=wantHigh?iHighest(sym,_Period,MODE_HIGH,cnt,from):iLowest(sym,_Period,MODE_LOW,cnt,from);
    if(k<0) return false;
    v=wantHigh?iHigh(sym,_Period,k):iLow(sym,_Period,k);
    return v>0;
+}
+
+// a、b 两个同类波段之间，价格没有越过两者中较“内侧”的那个
+// （低点：中间K线最低价都高于 max(a,b)；高点：中间最高价都低于 min(a,b)），
+// 即 a、b 就是这段走势里的两个关键低点/高点，可以拿来比较 SMT。
+bool KeySwingPair(const SWING &a,const SWING &b,bool highs)
+{
+   int from=b.idx+1, to=a.idx-1;          // series：a 更旧，idx 更大
+   if(to<from) return true;
+   double lim=highs?MathMin(a.price,b.price):MathMax(a.price,b.price);
+   for(int i=from;i<=to && i<N;i++)
+   {
+      if(highs && H[i]>lim) return false;
+      if(!highs && L[i]<lim) return false;
+   }
+   return true;
 }
 
 // 对一个对比品种检测波段背离；slot 用于多个品种时错开文字
@@ -635,25 +654,36 @@ void DetectSMT(string sym,double corr,int slot)
       int idx[]; ArrayResize(idx,0);
       for(int k=0;k<ArraySize(g_sw);k++) if(g_sw[k].high==highs) { int n=ArraySize(idx); ArrayResize(idx,n+1); idx[n]=k; }
       int cnt=ArraySize(idx);
-      for(int p=MathMax(1,cnt-SMTMaxPairs);p<cnt;p++)
+      bool otherHigh=(highs!=inverse);
+
+      for(int q=cnt-1;q>=MathMax(1,cnt-SMTMaxPairs);q--)
       {
-         SWING a=g_sw[idx[p-1]], b=g_sw[idx[p]];
-         bool otherHigh=(highs!=inverse);
-         double oa,ob;
-         if(!OtherExtreme(sym,a.time,otherHigh,oa) || !OtherExtreme(sym,b.time,otherHigh,ob)) continue;
+         SWING b=g_sw[idx[q]];
+         double ob;
+         if(!OtherExtreme(sym,b.time,otherHigh,ob)) continue;
 
-         bool meHigher=(b.price>a.price), meLower=(b.price<a.price);
-         bool otHigher=inverse?(ob<oa):(ob>oa), otLower=inverse?(ob>oa):(ob<oa);
-         bool smt=highs ? ((meHigher && !otHigher) || (otHigher && !meHigher))    // 一方创新高、另一方没有
-                        : ((meLower && !otLower)   || (otLower && !meLower));    // 一方创新低、另一方没有
-         if(!smt) continue;
+         // v1.20：不只比相邻波段，往前找最近的“关键波段”配对（中间没被越过的那个）
+         for(int p=q-1;p>=MathMax(0,q-SMTSwingDepth);p--)
+         {
+            SWING a=g_sw[idx[p]];
+            if(!KeySwingPair(a,b,highs)) continue;
+            double oa;
+            if(!OtherExtreme(sym,a.time,otherHigh,oa)) continue;
 
-         string id=sym+IntegerToString((long)b.time);
-         color c=highs?clrOrangeRed:clrSpringGreen;
-         double off=slot*0.35*g_atr*(highs?1:-1);
-         Seg("SMT"+id,a.time,a.price,b.time,b.price,c,STYLE_SOLID,2);
-         Txt("SMTt"+id,b.time,b.price+off,StringFormat("SMT%s vs %s",highs?"空":"多",sym),c,8,highs?ANCHOR_LEFT_LOWER:ANCHOR_LEFT_UPPER);
-         if(AlertOnSMT) Notify("SMT"+id+(highs?"H":"L"),StringFormat("SMT%s背离（对比 %s，相关 %.2f）",highs?"空":"多",sym,corr),b.idx-SwingLen);
+            bool meHigher=(b.price>a.price), meLower=(b.price<a.price);
+            bool otHigher=inverse?(ob<oa):(ob>oa), otLower=inverse?(ob>oa):(ob<oa);
+            bool smt=highs ? ((meHigher && !otHigher) || (otHigher && !meHigher))    // 一方创新高、另一方没有
+                           : ((meLower && !otLower)   || (otLower && !meLower));    // 一方创新低、另一方没有
+            if(!smt) continue;
+
+            string id=sym+IntegerToString((long)b.time);
+            color c=highs?clrOrangeRed:clrSpringGreen;
+            double off=slot*0.35*g_atr*(highs?1:-1);
+            Seg("SMT"+id,a.time,a.price,b.time,b.price,c,STYLE_SOLID,2);
+            Txt("SMTt"+id,b.time,b.price+off,StringFormat("SMT%s vs %s",highs?"空":"多",sym),c,8,highs?ANCHOR_LEFT_LOWER:ANCHOR_LEFT_UPPER);
+            if(AlertOnSMT) Notify("SMT"+id+(highs?"H":"L"),StringFormat("SMT%s背离（对比 %s，相关 %.2f）",highs?"空":"多",sym,corr),b.idx-SwingLen);
+            break;   // 每个新波段只标最近的一组
+         }
       }
    }
 }
