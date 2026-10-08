@@ -1,6 +1,6 @@
 #property strict
-#property version   "2.760"
-#property description "幽灵狙击手 - MT5黄金半自动交易与趋势过滤面板 v2.76 执行保护增强版"
+#property version   "2.770"
+#property description "幽灵狙击手 - MT5黄金半自动交易与趋势过滤面板 v2.77 执行保护增强版"
 
 #include <Trade/Trade.mqh>
 CTrade trade;
@@ -49,16 +49,17 @@ input double       FloatProfitPct       = 30.0; // 浮盈监控触发比例(浮�
 
 input group "=== 趋势过滤设置（RSI + ADX + VWAP） ==="
 input bool StartTrendFilter=true; // 启动时“只做趋势”总开关
+input bool FilterFollowChartTF=true; // 过滤系统(RSI/ADX/VWAP/双通道/波动灯)跟随图表周期；关闭时用下面各自指定的周期
 input bool EnableRSIFilter=true; input int RSIPeriod=14;
 input double RSINoBuyBelow=40.0; input double RSINoSellAbove=60.0;
 input bool EnableADXFilter=true;
-input ENUM_TIMEFRAMES ADXTimeframe=PERIOD_M5;
+input ENUM_TIMEFRAMES ADXTimeframe=PERIOD_M5; // 仅在不跟随图表周期时使用
 input int ADXPeriod=14;
 input double ADXTrendThreshold=25.0;
 input double ADXRangeThreshold=20.0;
 input bool UseDIDirection=true;
 input bool EnableVWAPFilter=true;
-input ENUM_TIMEFRAMES VWAPTimeframe=PERIOD_M5;
+input ENUM_TIMEFRAMES VWAPTimeframe=PERIOD_M5; // 仅在不跟随图表周期时使用
 input int VWAPSlopeLookback=6;
 input double VWAPTrendSlopePts=20.0;
 input double VWAPFlatSlopePts=8.0;
@@ -90,7 +91,7 @@ input double HTFPartialComposite     = 0.35;  // 加权值>=此值为偏多/偏�
 
 input group "=== BB+KC双通道 / VWAP偏差 ==="
 input bool EnableDualChannelFilter=true;
-input ENUM_TIMEFRAMES ChannelTimeframe=PERIOD_M5;
+input ENUM_TIMEFRAMES ChannelTimeframe=PERIOD_M5; // 仅在不跟随图表周期时使用
 input int BollingerPeriod=20;
 input double BollingerDev1=1.5;
 input double BollingerDev2=2.5;
@@ -216,7 +217,7 @@ string g_unifiedFollowName="";
 
 double g_lot=0.01;
 bool g_pause=false;
-datetime g_lastEmergency=0;
+ulong g_lastEmergencyMs=0; // v2.77：用真实毫秒计时，无报价时也不会误判二次确认
 string g_status="就绪";
 bool g_shortMode=true;
 bool g_manualTakeover=false;
@@ -304,6 +305,11 @@ double g_cacheTodayPL=0.0;
 datetime g_lastTodayPLCalc=0;
 
 bool g_tradeBusy=false;
+
+// v2.77：异步请求在途计数。服务器应答前新仓/新挂单还不在列表里，
+// 此时再开新批次会绕过总单数/单边手数上限，因此先等上一批应答。
+int g_asyncInflight=0;
+ulong g_asyncInflightSinceMs=0;
 ulong g_tradeCooldownUntilMs=0;
 
 // v2.74 交易服务器延迟监控：只跟踪“狙击多/空”异步市价批次。
@@ -327,6 +333,12 @@ double g_latencyWorstSlipPts=0.0;
 double g_latencySumSlipPts=0.0;
 string g_latencyText="成交延迟：待机";
 color g_latencyColor=C'170,180,190';
+
+// v2.77：过滤系统周期。跟随图表时切换周期会重新初始化EA并重建指标句柄。
+ENUM_TIMEFRAMES FilterTF(ENUM_TIMEFRAMES fixedTF)
+{
+   return FilterFollowChartTF ? (ENUM_TIMEFRAMES)_Period : fixedTF;
+}
 
 //---------------- scope / stats ----------------
 bool MatchPos()
@@ -451,13 +463,16 @@ datetime VWAPSessionStartServer()
 
    // 18:00纽约时间对应的UTC，再转换为当前经纪商服务器时间。
    datetime utcStart=nyStart-nyOff*3600;
-   int serverOffsetSec=(int)(TimeCurrent()-TimeGMT());
+   // v2.77：TimeCurrent()是最后报价时间，无报价时会偏；改用TimeTradeServer并按15分钟取整。
+   datetime server=TimeTradeServer();
+   if(server<=0)server=TimeCurrent();
+   int serverOffsetSec=(int)MathRound((double)(server-TimeGMT())/900.0)*900;
    return utcStart+serverOffsetSec;
 }
 bool BuildSessionVWAP(double &now,double &past,double &slope)
 {
  now=past=slope=0;MqlRates r[];ArraySetAsSeries(r,false);
- int n=CopyRates(_Symbol,VWAPTimeframe,VWAPSessionStartServer(),TimeCurrent(),r);
+ int n=CopyRates(_Symbol,FilterTF(VWAPTimeframe),VWAPSessionStartServer(),TimeCurrent(),r);
  if(n<MathMax(3,VWAPSlopeLookback+1))return false;
  double pv=0,v=0;double q[];ArrayResize(q,n);
  for(int i=0;i<n;i++){double typ=(r[i].high+r[i].low+r[i].close)/3.0;double vol=(r[i].real_volume>0?(double)r[i].real_volume:(double)r[i].tick_volume);if(vol<=0)vol=1;pv+=typ*vol;v+=vol;q[i]=pv/v;}
@@ -494,7 +509,7 @@ int DualChannelScore()
 }
 bool VWAPZ(double &z)
 {
- z=0;MqlRates r[];ArraySetAsSeries(r,false);int n=CopyRates(_Symbol,VWAPTimeframe,VWAPSessionStartServer(),TimeCurrent(),r);if(n<10)return false;int f=MathMax(0,n-VWAPDevLookbackBars);double sw=0,sp=0;
+ z=0;MqlRates r[];ArraySetAsSeries(r,false);int n=CopyRates(_Symbol,FilterTF(VWAPTimeframe),VWAPSessionStartServer(),TimeCurrent(),r);if(n<10)return false;int f=MathMax(0,n-VWAPDevLookbackBars);double sw=0,sp=0;
  for(int i=f;i<n;i++){double p=(r[i].high+r[i].low+r[i].close)/3,w=(r[i].real_volume>0?(double)r[i].real_volume:(double)r[i].tick_volume);if(w<=0)w=1;sw+=w;sp+=p*w;}double v=sp/sw,var=0;
  for(int i=f;i<n;i++){double p=(r[i].high+r[i].low+r[i].close)/3,w=(r[i].real_volume>0?(double)r[i].real_volume:(double)r[i].tick_volume);if(w<=0)w=1;var+=w*(p-v)*(p-v);}double sd=MathSqrt(var/sw);if(sd<=0)return false;MqlTick q;SymbolInfoTick(_Symbol,q);z=((q.bid+q.ask)/2-v)/sd;return true;
 }
@@ -566,7 +581,7 @@ int TrendBucketFromScore(int s)
 }
 void UpdateStableTrend(int rawScore)
 {
-   datetime bar=iTime(_Symbol,ChannelTimeframe,0);
+   datetime bar=iTime(_Symbol,FilterTF(ChannelTimeframe),0);
    if(bar<=0 || bar==g_lastTrendConfirmBar)return;
    g_lastTrendConfirmBar=bar;
    int b=TrendBucketFromScore(rawScore);
@@ -637,7 +652,8 @@ double SteppedTPPrice(ENUM_ORDER_TYPE type,double entry,int index){int d=StepTPB
 int RequiredHTFBars()
 {
    int p=MathMax(MathMax(HTFEMAFast,HTFEMAMid),MathMax(HTFEMASlow1,HTFEMASlow2));
-   return MathMax(p+MathMax(1,HTFSlopeLookback)+30,HTFADXPeriod*3+30);
+   // v2.77：EMA以首根收盘价起算，需约3~4倍周期才收敛；历史不足时CopyRates返回多少用多少。
+   return MathMax(p*4+MathMax(1,HTFSlopeLookback)+30,HTFADXPeriod*3+30);
 }
 int BuildNativeHTFBars(ENUM_TIMEFRAMES tf,HTF_BAR &out[])
 {
@@ -1310,6 +1326,25 @@ void FastStatusUpdate()
    ChartRedraw();
 }
 
+void NoteAsyncSubmitted(bool isAsync)
+{
+   if(!isAsync)return;
+   if(g_asyncInflight<=0)g_asyncInflightSinceMs=GetTickCount64();
+   g_asyncInflight++;
+}
+
+bool AsyncBatchInFlight()
+{
+   if(g_asyncInflight<=0)return false;
+   // 安全兜底：超时未收到应答时不永久锁死按键。
+   if(GetTickCount64()-g_asyncInflightSinceMs>(ulong)MathMax(3000,LatencySlowMs))
+   {
+      g_asyncInflight=0;
+      return false;
+   }
+   return true;
+}
+
 bool Market(ENUM_ORDER_TYPE type)
 {
    ulong ms=GetTickCount64();
@@ -1324,6 +1359,13 @@ bool Market(ENUM_ORDER_TYPE type)
    if(ms<g_tradeCooldownUntilMs)
    {
       g_status="刚提交一轮狙击单，已忽略重复按键/点击";
+      FastStatusUpdate();
+      return false;
+   }
+
+   if(AsyncBatchInFlight())
+   {
+      g_status="上一批请求等待服务器应答中（"+IntegerToString(g_asyncInflight)+"笔），稍后再按";
       FastStatusUpdate();
       return false;
    }
@@ -1440,6 +1482,7 @@ bool Market(ENUM_ORDER_TYPE type)
       }
 
       submitted++;
+      NoteAsyncSubmitted(InstantBatchMarket);
       if(isWelfare)welfareSubmittedLayer=layer;
    }
 
@@ -1555,6 +1598,13 @@ void Ladder(ENUM_ORDER_TYPE direction)
       return;
    }
 
+   if(AsyncBatchInFlight())
+   {
+      g_status="上一批请求等待服务器应答中（"+IntegerToString(g_asyncInflight)+"笔），稍后再按";
+      FastStatusUpdate();
+      return;
+   }
+
    if(!TradeOK() || !DirectionAllowed(direction))
    {
       FastStatusUpdate();
@@ -1627,7 +1677,10 @@ void Ladder(ENUM_ORDER_TYPE direction)
       for(int i=0;i<oldPendingCount;i++)
       {
          if(trade.OrderDelete(oldTickets[i]))
+         {
             deleteSubmitted++;
+            NoteAsyncSubmitted(InstantBatchLadder);
+         }
          else
          {
             lastFail="旧挂撤单本地提交失败";
@@ -1682,6 +1735,7 @@ void Ladder(ENUM_ORDER_TYPE direction)
    else
    {
       submitted=1;
+      NoteAsyncSubmitted(InstantBatchLadder);
       if(firstIsWelfare)welfareSubmittedLayer=1;
    }
 
@@ -1741,6 +1795,7 @@ void Ladder(ENUM_ORDER_TYPE direction)
          }
 
          submitted++;
+         NoteAsyncSubmitted(InstantBatchLadder);
          if(isWelfare)welfareSubmittedLayer=layer;
       }
    }
@@ -2418,6 +2473,15 @@ int CloseProfitByPercent(double pct,bool showStatus,bool includeWelfare)
    pct=MathMax(1.0,MathMin(100.0,pct));
    double realized=0.0, closedLots=0.0;
    int n=0;
+   double minv=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+   double step=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+   if(step<=0)step=0.01;
+
+   // v2.77：单笔按比例算出来不足最小手数的（如0.01手×50%），
+   // 合并成整笔平仓：5笔0.01手减50% → 平掉浮盈最大的2笔。
+   ulong poolTk[];double poolVol[],poolPf[];int poolN=0;
+   double poolTarget=0.0;
+
    for(int i=PositionsTotal()-1;i>=0;i--)
    {
       ulong tk=PositionGetTicket(i);
@@ -2426,26 +2490,48 @@ int CloseProfitByPercent(double pct,bool showStatus,bool includeWelfare)
       double pf=PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);
       if(pf<=0)continue;
       double vol=PositionGetDouble(POSITION_VOLUME);
-      double minv=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
-      double step=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
-      double closev=vol*pct/100.0;
-      if(step>0)closev=MathFloor(closev/step+1e-8)*step;
+      double closev=MathFloor(vol*pct/100.0/step+1e-8)*step;
       closev=NormalizeDouble(closev,2);
       bool ok=false;
       if(pct>=99.999 || closev>=vol-step/2.0)
       { closev=vol; ok=trade.PositionClose(tk,SlippagePoints); }
-      else if(closev>=minv)
+      else if(closev>=minv && vol-closev>=minv-1e-8)
          ok=trade.PositionClosePartial(tk,closev,SlippagePoints);
+      else
+      {
+         ArrayResize(poolTk,poolN+1);ArrayResize(poolVol,poolN+1);ArrayResize(poolPf,poolN+1);
+         poolTk[poolN]=tk;poolVol[poolN]=vol;poolPf[poolN]=pf;poolN++;
+         poolTarget+=vol*pct/100.0;
+         continue;
+      }
       if(ok)
       {
          realized+=pf*(closev/vol);closedLots+=closev;n++;
       }
    }
+
+   double remain=MathFloor(poolTarget/step+1e-8)*step;
+   while(poolN>0 && remain>=minv-1e-8)
+   {
+      int best=-1;
+      for(int j=0;j<poolN;j++)
+         if(poolVol[j]<=remain+1e-8 && (best<0 || poolPf[j]>poolPf[best]))best=j;
+      if(best<0)break;
+      if(trade.PositionClose(poolTk[best],SlippagePoints))
+      {
+         realized+=poolPf[best];closedLots+=poolVol[best];n++;
+      }
+      remain-=poolVol[best];
+      poolVol[best]=DBL_MAX; // 已处理，不再选中
+   }
+
    if(showStatus)
       g_status="盈利减仓 "+DoubleToString(pct,0)+"%：处理 "+IntegerToString(n)+
-               "单 / "+DoubleToString(closedLots,2)+"手，约兑现 "+DoubleToString(realized,2)+" USD";
+               "单 / "+DoubleToString(closedLots,2)+"手，约兑现 "+DoubleToString(realized,2)+" USD"+
+               (n==0&&poolN>0?"｜手数太小不足以按比例减仓":"");
    return n;
 }
+
 void CloseHalfWinners(){CloseProfitByPercent(50.0,true,true);}
 string UnifiedLineName(bool buy,bool tp)
 {
@@ -3092,7 +3178,7 @@ void Draw()
  int panelH=1015+statShift;
 
  Rect("BG",x,y,w,panelH,C'20,22,27');
- Txt("TITLE",x+10,y+7,"幽灵狙击手  MT5 v2.76 EXEC GUARD",11,C'255,210,40');
+ Txt("TITLE",x+10,y+7,"幽灵狙击手  MT5 v2.77 EXEC GUARD",11,C'255,210,40');
  Btn("HIDE",x+345,y+5,60,20,"隐藏 O",C'55,65,80');
  Txt("MODE",x+10,y+26,"Ghost Sniper · 黄金半自动交易/趋势过滤系统",8,C'210,210,210');
 
@@ -3450,8 +3536,17 @@ void Action(string a)
  else if(a=="ALL")
  {
    if(!EmergencyDoublePress)CloseAll();
-   else if(TimeCurrent()-g_lastEmergency<=EmergencyWindowSec)CloseAll();
-   else {g_lastEmergency=TimeCurrent();g_status="再次点击紧急全平进行确认";}
+   else if(g_lastEmergencyMs>0 &&
+           GetTickCount64()-g_lastEmergencyMs<=(ulong)MathMax(1,EmergencyWindowSec)*1000)
+   {
+      g_lastEmergencyMs=0;
+      CloseAll();
+   }
+   else
+   {
+      g_lastEmergencyMs=GetTickCount64();
+      g_status="再次点击紧急全平进行确认（"+IntegerToString(MathMax(1,EmergencyWindowSec))+"秒内）";
+   }
    lightOnly=true;
  }
 
@@ -3558,10 +3653,10 @@ int OnInit()
  g_offsetPts=(g_shortMode?ShortLadderOffset:LongLadderOffset); if(g_offsetPts<0)g_offsetPts=LadderOffsetPoints;
  g_orderCount=MathMax(1,MathMin(10,LadderOrders));g_welfareTPPts=WelfareTPPoints;g_welfareLayer=WelfareLayer;
  g_welfareEnabled=EnableWelfareOrder;g_steppedTP=EnableSteppedTP;g_floatTriggerPct=FloatProfitPct;g_panelHidden=false;
- hRSI=iRSI(_Symbol,PERIOD_CURRENT,RSIPeriod,PRICE_CLOSE);
- hADX=iADX(_Symbol,ADXTimeframe,ADXPeriod);
- hBands15=iBands(_Symbol,ChannelTimeframe,BollingerPeriod,0,BollingerDev1,PRICE_CLOSE); hBands25=iBands(_Symbol,ChannelTimeframe,BollingerPeriod,0,BollingerDev2,PRICE_CLOSE);
- hKCEMA=iMA(_Symbol,ChannelTimeframe,KeltnerEMAPeriod,0,MODE_EMA,PRICE_TYPICAL); hKCATR=iATR(_Symbol,ChannelTimeframe,KeltnerATRPeriod);
+ hRSI=iRSI(_Symbol,FilterTF(PERIOD_M5),RSIPeriod,PRICE_CLOSE);
+ hADX=iADX(_Symbol,FilterTF(ADXTimeframe),ADXPeriod);
+ hBands15=iBands(_Symbol,FilterTF(ChannelTimeframe),BollingerPeriod,0,BollingerDev1,PRICE_CLOSE); hBands25=iBands(_Symbol,FilterTF(ChannelTimeframe),BollingerPeriod,0,BollingerDev2,PRICE_CLOSE);
+ hKCEMA=iMA(_Symbol,FilterTF(ChannelTimeframe),KeltnerEMAPeriod,0,MODE_EMA,PRICE_TYPICAL); hKCATR=iATR(_Symbol,FilterTF(ChannelTimeframe),KeltnerATRPeriod);
  trade.SetExpertMagicNumber(MagicNumber);trade.SetDeviationInPoints(SlippagePoints);
  ClearCostCache();
  RefreshCommissionLearning(true);
@@ -3571,7 +3666,7 @@ int OnInit()
 
  ChartSetInteger(0,CHART_EVENT_MOUSE_MOVE,true);
  EventSetMillisecondTimer(MathMax(250,PanelRefreshMs));
- g_status="幽灵狙击手 v2.76 就绪｜佣金自学习+动态滑点缓冲+保护修改重试";
+ g_status="幽灵狙击手 v2.77 就绪｜过滤周期 "+EnumToString(FilterTF(PERIOD_M5))+"｜佣金自学习+动态滑点缓冲+保护修改重试";
  Draw();return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason)
@@ -3598,7 +3693,31 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    if(trans.type==TRADE_TRANSACTION_DEAL_ADD)
    {
       ClearCostCache();
-      g_commissionLearnStamp=0; // 新成交可能带来新的真实佣金样本
+      // 新成交可能带来新的真实佣金样本：约30秒后重新学习，
+      // 一批5笔成交只扫描一次30天历史，而不是每笔都扫。
+      datetime soon=TimeCurrent()-270;
+      if(g_commissionLearnStamp>soon)g_commissionLearnStamp=soon;
+   }
+
+   if(trans.type==TRADE_TRANSACTION_REQUEST &&
+      (request.magic==MagicNumber || request.magic==WelfareMagic))
+   {
+      // CTrade撤单请求不带symbol，只按魔术号识别。
+      bool mine=(request.symbol==_Symbol ||
+                 (request.action==TRADE_ACTION_REMOVE && request.symbol==""));
+      bool newExposure=((request.action==TRADE_ACTION_DEAL && request.position==0) ||
+                        request.action==TRADE_ACTION_PENDING ||
+                        request.action==TRADE_ACTION_REMOVE);
+      if(mine && newExposure && g_asyncInflight>0)g_asyncInflight--;
+
+      if(mine && request.action==TRADE_ACTION_REMOVE &&
+         result.retcode!=TRADE_RETCODE_DONE && result.retcode!=TRADE_RETCODE_PLACED)
+      {
+         g_status="⚠ 旧挂单#"+IntegerToString((long)request.order)+"撤单被拒(retcode "+
+                  IntegerToString((int)result.retcode)+")，新旧阶梯可能叠加，请检查挂单";
+         Print("幽灵狙击：",g_status);
+         FastStatusUpdate();
+      }
    }
 
    if(!EnableTradeLatencyMonitor)return;
