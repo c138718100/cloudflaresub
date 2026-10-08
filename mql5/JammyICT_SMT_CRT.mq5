@@ -4,8 +4,8 @@
 //| 每根新K线重算一次（只用已收盘K线，不重绘），全部用图形对象绘制。       |
 //+------------------------------------------------------------------+
 #property copyright "Jammy"
-#property version   "1.20"
-#property description "Jammy ICT Suite v1.20：SMT / 结构(BOS·CHoCH) / FVG / OB / 流动性 / 折价溢价·OTE / Killzone / CRT"
+#property version   "1.30"
+#property description "Jammy ICT Suite v1.30：SMT / 结构(BOS·CHoCH) / FVG / OB / 流动性 / 折价溢价·OTE / Killzone / CRT"
 #property indicator_chart_window
 #property indicator_buffers 0
 #property indicator_plots   0
@@ -26,7 +26,7 @@ input string SMTCandidates       = "XAGUSD,DXY,USDX,EURUSD,XPTUSD,US500"; // 当
 input int    CorrBars            = 120;   // 相关系数回看K线数（收益率相关）
 input double MinAbsCorr          = 0.50;  // |相关系数| 至少多少才判 SMT
 input bool   SMTGroupIgnoreCorr  = false; // 固定配对时不看相关系数门槛
-input int    SMTMaxPairs         = 6;     // 检查最近多少个波段点
+input int    SMTMaxPairs         = 8;     // 检查最近多少个波段点（两品种合并后）
 input int    SMTSwingDepth       = 6;     // 每个新波段点往前最多对比几个旧波段（不限于相邻）
 input int    SMTOtherWindow      = 6;     // 对比品种取极值的时间窗口（±K线数）
 
@@ -615,73 +615,112 @@ bool BuildPartners(string &out[])
    return false;
 }
 
-// 对方品种在某个时间附近（±SwingLen根）的最高/最低
-bool OtherExtreme(string sym,datetime t,bool wantHigh,double &v)
+// ---------------- v1.30 SMT：两个品种的波段时间合并后，在同一对时间点上比较 ----------------
+// 这样 EURUSD 图和 GBPUSD 图上找到的是同一组 SMT（互为镜像），不会各画各的。
+
+// sym 在时间 t 附近（±W 根已收盘K线）的最高/最低价及其时间
+bool ExtremeNear(string sym,datetime t,bool wantHigh,double &v,datetime &vt)
 {
    int sh=iBarShift(sym,_Period,t,false);
    if(sh<0) return false;
-   int w=MathMax(SwingLen,SMTOtherWindow);   // 两个品种的极值常差几根K线，窗口放宽
-   int from=MathMax(0,sh-w), cnt=2*w+1;
-   int k=wantHigh?iHighest(sym,_Period,MODE_HIGH,cnt,from):iLowest(sym,_Period,MODE_LOW,cnt,from);
+   int w=MathMax(SwingLen,SMTOtherWindow);
+   int from=MathMax(1,sh-w), to=sh+w;
+   if(to<from) return false;
+   int k=wantHigh?iHighest(sym,_Period,MODE_HIGH,to-from+1,from):iLowest(sym,_Period,MODE_LOW,to-from+1,from);
    if(k<0) return false;
    v=wantHigh?iHigh(sym,_Period,k):iLow(sym,_Period,k);
-   return v>0;
+   vt=iTime(sym,_Period,k);
+   return v>0 && vt>0;
 }
 
-// a、b 两个同类波段之间，价格没有越过两者中较“内侧”的那个
-// （低点：中间K线最低价都高于 max(a,b)；高点：中间最高价都低于 min(a,b)），
-// 即 a、b 就是这段走势里的两个关键低点/高点，可以拿来比较 SMT。
-bool KeySwingPair(const SWING &a,const SWING &b,bool highs)
+// t1(旧)、t2(新)两根K线之间（不含两端）价格有没有越过两者中较“内侧”的那个
+// 低点：中间最低价 >= min(v1,v2) 才算“这两个点就是这段的关键低点”；高点反之
+bool KeyBetween(string sym,datetime t1,datetime t2,double v1,double v2,bool highs)
 {
-   int from=b.idx+1, to=a.idx-1;          // series：a 更旧，idx 更大
-   if(to<from) return true;
-   double lim=highs?MathMin(a.price,b.price):MathMax(a.price,b.price);
-   for(int i=from;i<=to && i<N;i++)
+   int s1=iBarShift(sym,_Period,t1,false), s2=iBarShift(sym,_Period,t2,false);
+   if(s1<0 || s2<0) return false;
+   int cnt=s1-s2-1;
+   if(cnt<=0) return true;
+   if(highs)
    {
-      if(highs && H[i]>lim) return false;
-      if(!highs && L[i]<lim) return false;
+      int k=iHighest(sym,_Period,MODE_HIGH,cnt,s2+1);
+      return k<0 || iHigh(sym,_Period,k)<=MathMax(v1,v2);
    }
-   return true;
+   int k=iLowest(sym,_Period,MODE_LOW,cnt,s2+1);
+   return k<0 || iLow(sym,_Period,k)>=MathMin(v1,v2);
 }
 
-// 对一个对比品种检测波段背离；slot 用于多个品种时错开文字
+// 某品种的波段时间（已确认，左右各 SwingLen 根）
+void PivotTimes(string sym,bool highs,datetime &out[])
+{
+   ArrayResize(out,0);
+   MqlRates r[]; ArraySetAsSeries(r,true);
+   int n=CopyRates(sym,_Period,0,N,r);
+   for(int i=n-1-SwingLen;i>=SwingLen+1;i--)
+   {
+      bool ok=true;
+      for(int k=1;k<=SwingLen && ok;k++)
+      {
+         if(highs) ok=(r[i].high>r[i-k].high && r[i].high>=r[i+k].high);
+         else      ok=(r[i].low <r[i-k].low  && r[i].low <=r[i+k].low);
+      }
+      if(ok) { int m=ArraySize(out); ArrayResize(out,m+1); out[m]=r[i].time; }
+   }
+}
+
 void DetectSMT(string sym,double corr,int slot)
 {
    bool inverse=(corr<0);   // 负相关：我方高点对应对方低点
+   int gap=MathMax(SwingLen,SMTOtherWindow)*PeriodSeconds();
+
    for(int pass=0;pass<2;pass++)
    {
       bool highs=(pass==0);
-      int idx[]; ArrayResize(idx,0);
-      for(int k=0;k<ArraySize(g_sw);k++) if(g_sw[k].high==highs) { int n=ArraySize(idx); ArrayResize(idx,n+1); idx[n]=k; }
-      int cnt=ArraySize(idx);
       bool otherHigh=(highs!=inverse);
 
-      for(int q=cnt-1;q>=MathMax(1,cnt-SMTMaxPairs);q--)
+      // 合并两个品种的波段时间（按时间升序，相距太近的合并为一个）
+      datetime a1[],a2[],all[];
+      PivotTimes(_Symbol,highs,a1);
+      PivotTimes(sym,otherHigh,a2);
+      ArrayResize(all,0);
+      for(int i=0;i<ArraySize(a1);i++){ int m=ArraySize(all); ArrayResize(all,m+1); all[m]=a1[i]; }
+      for(int i=0;i<ArraySize(a2);i++){ int m=ArraySize(all); ArrayResize(all,m+1); all[m]=a2[i]; }
+      ArraySort(all);
+      datetime piv[]; ArrayResize(piv,0);
+      for(int i=0;i<ArraySize(all);i++)
       {
-         SWING b=g_sw[idx[q]];
-         double ob;
-         if(!OtherExtreme(sym,b.time,otherHigh,ob)) continue;
+         int m=ArraySize(piv);
+         if(m>0 && all[i]-piv[m-1]<gap) continue;
+         ArrayResize(piv,m+1); piv[m]=all[i];
+      }
+      int cnt=ArraySize(piv);
 
-         // v1.20：不只比相邻波段，往前找最近的“关键波段”配对（中间没被越过的那个）
-         for(int p=q-1;p>=MathMax(0,q-SMTSwingDepth);p--)
+      for(int j=cnt-1;j>=MathMax(1,cnt-SMTMaxPairs);j--)
+      {
+         double mB,oB; datetime mBt,oBt;
+         if(!ExtremeNear(_Symbol,piv[j],highs,mB,mBt) || !ExtremeNear(sym,piv[j],otherHigh,oB,oBt)) continue;
+
+         for(int i=j-1;i>=MathMax(0,j-SMTSwingDepth);i--)
          {
-            SWING a=g_sw[idx[p]];
-            if(!KeySwingPair(a,b,highs)) continue;
-            double oa;
-            if(!OtherExtreme(sym,a.time,otherHigh,oa)) continue;
+            double mA,oA; datetime mAt,oAt;
+            if(!ExtremeNear(_Symbol,piv[i],highs,mA,mAt) || !ExtremeNear(sym,piv[i],otherHigh,oA,oAt)) continue;
+            if(mAt>=mBt || oAt>=oBt) continue;
 
-            bool meHigher=(b.price>a.price), meLower=(b.price<a.price);
-            bool otHigher=inverse?(ob<oa):(ob>oa), otLower=inverse?(ob>oa):(ob<oa);
-            bool smt=highs ? ((meHigher && !otHigher) || (otHigher && !meHigher))    // 一方创新高、另一方没有
-                           : ((meLower && !otLower)   || (otLower && !meLower));    // 一方创新低、另一方没有
-            if(!smt) continue;
+            // 两个品种在这两点之间都没有越过“内侧”那个点：这一对就是双方的关键高/低点
+            if(!KeyBetween(_Symbol,mAt,mBt,mA,mB,highs) || !KeyBetween(sym,oAt,oBt,oA,oB,otherHigh)) continue;
 
-            string id=sym+IntegerToString((long)b.time);
+            bool meBreak=highs?(mB>mA):(mB<mA);
+            bool otBreak=otherHigh?(oB>oA):(oB<oA);
+            if(meBreak==otBreak) continue;        // 同时破或同时不破 = 没有背离
+
+            string id=sym+IntegerToString((long)mBt);
             color c=highs?clrOrangeRed:clrSpringGreen;
             double off=slot*0.35*g_atr*(highs?1:-1);
-            Seg("SMT"+id,a.time,a.price,b.time,b.price,c,STYLE_SOLID,2);
-            Txt("SMTt"+id,b.time,b.price+off,StringFormat("SMT%s vs %s",highs?"空":"多",sym),c,8,highs?ANCHOR_LEFT_LOWER:ANCHOR_LEFT_UPPER);
-            if(AlertOnSMT) Notify("SMT"+id+(highs?"H":"L"),StringFormat("SMT%s背离（对比 %s，相关 %.2f）",highs?"空":"多",sym,corr),b.idx-SwingLen);
+            Seg("SMT"+id,mAt,mA,mBt,mB,c,STYLE_SOLID,2);
+            string who=meBreak?(highs?"本品种创新高":"本品种创新低"):(highs?sym+"创新高":sym+"创新低");
+            Txt("SMTt"+id,mBt,mB+off,StringFormat("SMT%s vs %s（%s）",highs?"空":"多",sym,who),c,8,highs?ANCHOR_LEFT_LOWER:ANCHOR_LEFT_UPPER);
+            int barIdx=iBarShift(_Symbol,_Period,piv[j],false)-SwingLen;
+            if(AlertOnSMT) Notify("SMT"+id+(highs?"H":"L"),StringFormat("SMT%s背离（对比 %s，相关 %.2f，%s）",highs?"空":"多",sym,corr,who),barIdx);
             break;   // 每个新波段只标最近的一组
          }
       }
