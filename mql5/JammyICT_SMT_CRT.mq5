@@ -4,8 +4,8 @@
 //| 每根新K线重算一次（只用已收盘K线，不重绘），全部用图形对象绘制。       |
 //+------------------------------------------------------------------+
 #property copyright "Jammy"
-#property version   "1.40"
-#property description "Jammy ICT Suite v1.40：SMT / 结构(BOS·CHoCH) / FVG / OB / 流动性 / 折价溢价·OTE / Killzone / CRT"
+#property version   "1.50"
+#property description "Jammy ICT Suite v1.50：SMT / 结构(BOS·CHoCH) / FVG / OB / 流动性 / 折价溢价·OTE / Killzone / CRT"
 #property indicator_chart_window
 #property indicator_buffers 0
 #property indicator_plots   0
@@ -53,7 +53,9 @@ input color  BearOBColor         = C'110,60,10';
 input group "=== 流动性 ==="
 input bool   ShowLiquidity       = true;
 input double EqualTolATR         = 0.10;  // 等高/等低容差（ATR倍数）
-input bool   ShowSweeps          = true;
+input int    MaxLiquidityPools   = 3;     // 每侧最多显示几个“还没被扫”的流动性池（最近的优先）
+input bool   ShowSwingPools      = true;  // 单个未被扫的波段高/低点也显示为 BSL/SSL（关=只显示等高/等低）
+input bool   ShowSweeps          = false; // 显示“已扫流动性”的标记（默认不显示）
 
 input group "=== 折价 / 溢价 / OTE ==="
 input bool   ShowPremiumDiscount = true;
@@ -369,33 +371,59 @@ void FVG()
 //+------------------------------------------------------------------+
 //| 流动性：等高 / 等低                                                |
 //+------------------------------------------------------------------+
+// v1.50：只显示“还没被扫掉”的流动性池：
+// 波段高点之后任何一根已收盘K线的最高价越过它 = 已被扫，不再显示（低点同理）。
+bool PoolSwept(int idx,double level,bool high)
+{
+   for(int i=idx-1;i>=1;i--)
+   {
+      if(high && H[i]>level) return true;
+      if(!high && L[i]<level) return true;
+   }
+   return false;
+}
+
 void EqualHighsLows()
 {
    if(!ShowLiquidity) return;
    double tol=EqualTolATR*g_atr;
-   int lastH=-1,lastL=-1;
-   for(int k=0;k<ArraySize(g_sw);k++)
+   int nsw=ArraySize(g_sw);
+   bool used[]; ArrayResize(used,nsw); ArrayInitialize(used,false);
+   int shownH=0,shownL=0;
+
+   for(int k=nsw-1;k>=0;k--)            // 从最新往旧
    {
-      if(g_sw[k].high)
+      if(used[k]) continue;
+      bool high=g_sw[k].high;
+      if(high ? shownH>=MaxLiquidityPools : shownL>=MaxLiquidityPools) continue;
+
+      // 找前一个同类、价格在容差内的波段点 → 等高/等低
+      int eq=-1;
+      for(int p=k-1;p>=0;p--)
       {
-         if(lastH>=0 && MathAbs(g_sw[k].price-g_sw[lastH].price)<=tol)
-         {
-            double lv=MathMax(g_sw[k].price,g_sw[lastH].price);
-            Seg("EQH"+IntegerToString(k),g_sw[lastH].time,lv,RightEdge(),lv,clrGold,STYLE_DASHDOT);
-            Txt("EQHt"+IntegerToString(k),RightEdge(),lv,"EQH 买方流动性",clrGold,7,ANCHOR_RIGHT_LOWER);
-         }
-         lastH=k;
+         if(g_sw[p].high!=high || used[p]) continue;
+         if(MathAbs(g_sw[p].price-g_sw[k].price)<=tol) { eq=p; break; }
+         // 中间出现更高(更低)的同类点，说明两者不在同一层，停止
+         if(high ? g_sw[p].price>g_sw[k].price+tol : g_sw[p].price<g_sw[k].price-tol) break;
       }
-      else
+      if(eq<0 && !ShowSwingPools) continue;
+
+      double lv=g_sw[k].price;
+      int fromIdx=g_sw[k].idx; datetime t1=g_sw[k].time;
+      if(eq>=0)
       {
-         if(lastL>=0 && MathAbs(g_sw[k].price-g_sw[lastL].price)<=tol)
-         {
-            double lv=MathMin(g_sw[k].price,g_sw[lastL].price);
-            Seg("EQL"+IntegerToString(k),g_sw[lastL].time,lv,RightEdge(),lv,clrGold,STYLE_DASHDOT);
-            Txt("EQLt"+IntegerToString(k),RightEdge(),lv,"EQL 卖方流动性",clrGold,7,ANCHOR_RIGHT_UPPER);
-         }
-         lastL=k;
+         lv=high?MathMax(lv,g_sw[eq].price):MathMin(lv,g_sw[eq].price);
+         fromIdx=g_sw[eq].idx; t1=g_sw[eq].time;
+         used[eq]=true;
       }
+      if(PoolSwept(fromIdx,lv,high)) continue;   // 已被扫：不显示
+
+      string id=IntegerToString(k);
+      string label=(eq>=0 ? (high?"EQH 买方流动性":"EQL 卖方流动性") : (high?"BSL":"SSL"));
+      color c=(eq>=0?clrGold:clrDarkKhaki);
+      Seg("LQ"+id,t1,lv,RightEdge(),lv,c,eq>=0?STYLE_DASHDOT:STYLE_DOT);
+      Txt("LQt"+id,RightEdge(),lv,label,c,7,high?ANCHOR_RIGHT_LOWER:ANCHOR_RIGHT_UPPER);
+      if(high) shownH++; else shownL++;
    }
 }
 
