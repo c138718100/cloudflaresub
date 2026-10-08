@@ -1,7 +1,7 @@
 #property copyright "Jammy / OpenAI - independent MT5 port"
-#property version   "1.681"
+#property version   "1.690"
 #property strict
-#property description "Jammy Smart Accumulation MT5 v1.68.1 Trading Core Lite + NumPad + RiskGuard"
+#property description "Jammy Smart Accumulation MT5 v1.69.0 Trading Core Lite + NumPad + RiskGuard"
 #property description "Trading core only: smart accumulation + manual market/pending manager. Heatmap/MTF dashboard moved to standalone indicator."
 
 // v1.67.3 UI变化：主面板底部信息区可折叠；状态文字拆成多行并始终留在面板背景内部。
@@ -158,6 +158,10 @@ input(name="小止盈至少=单次交易成本(点差+佣金)的倍数") double 
 input(name="止损放在框外的缓冲（1小时ATR倍数，0=贴框边）") double SmartStopBufferATR = 0.15;
 input(name="硬止损需收盘确认跌破/升破框边（关=碰框边即清仓）") bool HardStopCloseConfirm = true;
 input(name="收盘确认周期") ENUM_TIMEFRAMES HardStopConfirmTF = PERIOD_M15;
+
+input group "v1.69 24小时运行"
+input(name="24小时运行：吸筹挂单不过期、单笔失败不暂停、定时补齐奇数槽") bool SmartRun24h = true;
+input(name="奇数槽巡检间隔(分钟)") int SlotRepairMinutes = 5;
 
 input group "v1.68 新闻暂停（MT5经济日历）"
 input(name="高影响数据前后暂停自动补单/重排/循环") bool NewsPauseEnable = false;
@@ -399,6 +403,13 @@ double g_plan_gap_price=0.0;
 int g_plan_slot_max=0;
 double g_smart_gap_price=0.0;
 int g_smart_slot_max=0;
+
+// v1.69：统一TP/SL异步批量状态
+ulong  g_uniTickets[];
+int    g_uniPending=0,g_uniOk=0,g_uniFail=0,g_uniTarget=0;
+bool   g_uniBuy=true,g_uniHasTP=false,g_uniHasSL=false;
+ulong  g_uniStartMs=0;
+datetime g_lastSlotRepair=0;
 
 // v1.68：止损缓冲（价格单位）。计算吸金计划时冻结，运行期间不随ATR变化，避免SL反复被改。
 double g_stop_buffer=0.0;
@@ -2077,6 +2088,26 @@ void PrepareSmartPlan()
    g_plan_slot_max=0;
    for(int si=0;si<ArraySize(slots);si++) g_plan_slot_max=MathMax(g_plan_slot_max,slots[si]);
 
+   // v1.69：已有吸筹持仓占用的槽位不再重复挂单（否则同名两张单，止盈后该槽不会再补回）。
+   {
+      double fp[]; int fs[]; ArrayResize(fp,0); ArrayResize(fs,0);
+      for(int k=0;k<ArraySize(prices);k++)
+      {
+         if(SmartSlotPositionOccupied(slots[k],slots[k]%2==1)) continue;
+         int n=ArraySize(fp); ArrayResize(fp,n+1); ArrayResize(fs,n+1);
+         fp[n]=prices[k]; fs[n]=slots[k];
+      }
+      if(ArraySize(fp)<ArraySize(prices))
+      {
+         if(ArraySize(fp)==0) { SetStatus("新框所有槽位都已有吸筹持仓，无需新增挂单"); return; }
+         double nl=EqualLotsForPrices(fp,risk_budget);
+         if(nl<=0) { SetStatus("跳过已占用槽位后，剩余风险不足最小手数"); return; }
+         ArrayResize(prices,ArraySize(fp)); ArrayResize(slots,ArraySize(fs));
+         for(int k=0;k<ArraySize(fp);k++) { prices[k]=fp[k]; slots[k]=fs[k]; }
+         lots=nl;
+      }
+   }
+
    g_even_batch_tp1=g_even_batch_tp2=g_even_batch_tp3=0.0;
    double even_group_risk=0.0,even_target_profit=0.0,even_actual_profit=0.0;
    bool even_tp_ok=EvenBatchTakeProfit &&
@@ -2779,6 +2810,12 @@ void RebuildPendingGrid(bool force=false)
    double pct=(AccountInfoDouble(ACCOUNT_EQUITY)>0 ? after_used/AccountInfoDouble(ACCOUNT_EQUITY)*100.0 : 0.0);
    g_last_regrid_center=center; g_last_regrid_time=TimeCurrent(); g_regrid_busy=false;
 
+   if(placed<expected && SmartRun24h)
+   {
+      // v1.69：24小时运行时保留已挂成功的单，缺的奇数槽由定时巡检补齐，不暂停系统。
+      SetStatus(StringFormat("动态重排部分执行：成功%d/%d｜已挂单保留，缺失奇数槽将定时补齐",placed,expected));
+      return;
+   }
    if(placed<expected)
    {
       CancelSmartPending();
@@ -3007,6 +3044,7 @@ bool TryAutoResumeSmart()
 
 void ExpireSmartOrders()
 {
+   if(SmartRun24h) return;   // v1.69：24小时运行，吸筹挂单不过期
    if(PendingValidBars<=0 && PendingValidMinutes<=0) return;
    ExpireItem arr[]; ArrayResize(arr,0);
    for(int i=OrdersTotal()-1;i>=0;i--)
@@ -4078,6 +4116,52 @@ void PrepareUnifiedLine(bool buy,bool tp)
    SetStatus("统一线跟随鼠标：移动到目标价后，在图表空白处单击固定，再点确认统一");
 }
 
+// v1.69：异步修改单笔持仓SL/TP（预检同 ModifyPositionTicket，不等服务器回报）
+bool ModifyPositionTicketAsync(ulong ticket,double sl,double tp)
+{
+   if(!PositionSelectByTicket(ticket)) return false;
+   sl=sl>0?NormalizePrice(sl):0.0;
+   tp=tp>0?NormalizePrice(tp):0.0;
+   if(!ValidatePositionProtection(ticket,sl,tp)) return false;
+   MqlTradeRequest req; MqlTradeResult res; ZeroMemory(req); ZeroMemory(res);
+   req.action=TRADE_ACTION_SLTP; req.position=ticket; req.symbol=PositionGetString(POSITION_SYMBOL);
+   req.sl=sl; req.tp=tp; req.magic=MagicNumber;
+   return OrderSendAsync(req,res);
+}
+
+void FinishUnifiedBatch(bool timeout)
+{
+   string side=(g_uniBuy?"多":"空");
+   int unconfirmed=g_uniPending;
+   g_uniPending=0;
+   ArrayResize(g_uniTickets,0);
+   if(!timeout && g_uniFail==0 && g_uniOk==g_uniTarget)
+   {
+      if(g_uniHasTP) ObjectDelete(0,g_uniBuy?OBJ_LONG_TP:OBJ_SHORT_TP);
+      if(g_uniHasSL) ObjectDelete(0,g_uniBuy?OBJ_LONG_SL:OBJ_SHORT_SL);
+      ChartRedraw();
+      SetStatus(StringFormat("统一%s已应用：%d笔｜用时%dms｜统一线已自动消失",side,g_uniOk,(int)(GetTickCount64()-g_uniStartMs)));
+   }
+   else
+      SetStatus(StringFormat("统一%s部分完成：成功%d/%d，失败%d%s｜统一线保留便于重试",side,g_uniOk,g_uniTarget,g_uniFail,
+                             unconfirmed>0?StringFormat("，未确认%d",unconfirmed):""));
+}
+
+void OnUnifiedModifyResult(const MqlTradeRequest &request,const MqlTradeResult &result)
+{
+   if(g_uniPending<=0 || request.action!=TRADE_ACTION_SLTP) return;
+   for(int i=0;i<ArraySize(g_uniTickets);i++)
+   {
+      if(g_uniTickets[i]!=request.position) continue;
+      g_uniTickets[i]=0;
+      g_uniPending--;
+      if(result.retcode==TRADE_RETCODE_DONE || result.retcode==TRADE_RETCODE_NO_CHANGES || result.retcode==TRADE_RETCODE_PLACED) g_uniOk++;
+      else { g_uniFail++; Print("JSA 统一TP/SL被拒：票号=",request.position," retcode=",result.retcode); }
+      if(g_uniPending<=0) FinishUnifiedBatch(false);
+      return;
+   }
+}
+
 void ApplyUnified(bool buy)
 {
    string tpname=buy?OBJ_LONG_TP:OBJ_SHORT_TP;
@@ -4094,10 +4178,15 @@ void ApplyUnified(bool buy)
    double tp=htp?ObjectGetDouble(0,tpname,OBJPROP_PRICE):0;
    double sl=hsl?ObjectGetDouble(0,slname,OBJPROP_PRICE):0;
 
-   int target=0;
-   int ok=0;
-   int fail=0;
+   if(g_uniPending>0)
+   {
+      SetStatus(StringFormat("上一轮统一TP/SL仍在等待服务器确认（%d笔），请稍候",g_uniPending));
+      return;
+   }
 
+   // v1.69：所有目标持仓一次性异步提交，不再逐笔等待服务器回报。
+   ArrayResize(g_uniTickets,0);
+   int target=0,sent=0,localFail=0;
    for(int i=PositionsTotal()-1;i>=0;i--)
    {
       ulong t=PositionGetTicket(i);
@@ -4111,35 +4200,28 @@ void ApplyUnified(bool buy)
       double nsl=hsl?sl:PositionGetDouble(POSITION_SL);
       double ntp=htp?tp:PositionGetDouble(POSITION_TP);
 
-      if(ModifyPositionTicket(t,nsl,ntp)) ok++;
-      else fail++;
+      if(ModifyPositionTicketAsync(t,nsl,ntp))
+      {
+         int n=ArraySize(g_uniTickets); ArrayResize(g_uniTickets,n+1); g_uniTickets[n]=t;
+         sent++;
+      }
+      else localFail++;
    }
+
+   g_unified_follow_active=false;
+   g_unified_follow_name="";
 
    if(target<=0)
    {
-      g_unified_follow_active=false;
-      g_unified_follow_name="";
       SetStatus(StringFormat("统一%s：当前没有可处理持仓，统一线保留",buy?"多":"空"));
       return;
    }
 
-   // v1.66.2：全部目标仓位修改成功后，自动删除本方向统一TP/SL辅助线。
-   // 若有任意失败则保留辅助线，方便用户检查后直接重试，避免误以为全部设置成功。
-   g_unified_follow_active=false;
-   g_unified_follow_name="";
-
-   if(fail==0 && ok==target)
-   {
-      if(htp) ObjectDelete(0,tpname);
-      if(hsl) ObjectDelete(0,slname);
-      ChartRedraw();
-      SetStatus(StringFormat("统一%s已应用：%d笔｜统一线已自动消失",buy?"多":"空",ok));
-   }
-   else
-   {
-      SetStatus(StringFormat("统一%s部分完成：成功%d/%d，失败%d｜统一线保留便于重试",
-                             buy?"多":"空",ok,target,fail));
-   }
+   g_uniBuy=buy; g_uniHasTP=htp; g_uniHasSL=hsl;
+   g_uniTarget=target; g_uniPending=sent; g_uniOk=0; g_uniFail=localFail;
+   g_uniStartMs=GetTickCount64();
+   if(sent<=0) { FinishUnifiedBatch(false); return; }
+   SetStatus(StringFormat("统一%s：已同时提交%d笔，等待服务器确认…",buy?"多":"空",sent));
 }
 
 // =========================
@@ -4803,7 +4885,7 @@ void BuildMainPanel()
 
    // 先给足背景高度，最后再按实际内容精确收口，避免构建过程中出现文字短暂跑出背景。
    RectLabel(UI_PREFIX+"BG",x,y,w,780,C'11,16,22');
-   Label(UI_PREFIX+"TITLE","Jammy 吞金兽 MT5 v1.68.1｜Auction + NumPad",x+8,y+6,clrDeepSkyBlue,FontSize+1);
+   Label(UI_PREFIX+"TITLE","Jammy 吞金兽 MT5 v1.69｜24H Auction + NumPad",x+8,y+6,clrDeepSkyBlue,FontSize+1);
    int yy=y+28; int bw=(w-5*g)/4;
    Button(UI_PREFIX+"LOCK","一键锁仓 [/]",x+g,yy,bw,bh,clrMaroon); Button(UI_PREFIX+"CLOSEALL","一键清仓 [*]",x+2*g+bw,yy,bw,bh,clrRed); Button(UI_PREFIX+"TRAIL","一键追踪",x+3*g+2*bw,yy,bw,bh,clrSteelBlue); Button(UI_PREFIX+"SMARTCALC","智能吸金/计算",x+4*g+3*bw,yy,bw,bh,clrPurple);
    yy+=bh+g;
@@ -4993,6 +5075,36 @@ void BuildAnalyticsPanel()
    MoveAnalyticsRightBottom();
 }
 
+// v1.69：面板改过的参数保存下来，重载后继续沿用；若之后在EA参数里改了对应值，以参数为准。
+void SavePanelOne(string key,double v,double inputVal)
+{
+   GlobalVariableSet(StableGV("P_"+key),v);
+   GlobalVariableSet(StableGV("P_"+key+"_IN"),inputVal);
+}
+bool LoadPanelOne(string key,double inputVal,double &out)
+{
+   string g=StableGV("P_"+key), gi=StableGV("P_"+key+"_IN");
+   if(!GlobalVariableCheck(g) || !GlobalVariableCheck(gi)) return false;
+   if(MathAbs(GlobalVariableGet(gi)-inputVal)>1e-9) return false;   // 参数被改过 → 用参数
+   out=GlobalVariableGet(g);
+   return true;
+}
+void SavePanelInputs()
+{
+   SavePanelOne("RISK",g_risk_usd,RiskUsd);
+   SavePanelOne("LOTS",g_fixed_lots,FixedLotsDefault);
+   SavePanelOne("BASE",g_base_ratio,BasePositionRatioDefault);
+   SavePanelOne("RR",g_even_rr,EvenRR);
+}
+void LoadPanelInputs()
+{
+   double v;
+   if(LoadPanelOne("RISK",RiskUsd,v) && v>0) g_risk_usd=v;
+   if(LoadPanelOne("LOTS",FixedLotsDefault,v) && v>=0) g_fixed_lots=v;
+   if(LoadPanelOne("BASE",BasePositionRatioDefault,v) && v>0 && v<=1) g_base_ratio=v;
+   if(LoadPanelOne("RR",EvenRR,v) && v>=0.10) g_even_rr=v;
+}
+
 void ApplyPanelInputs()
 {
    string v=ObjectGetString(0,UI_PREFIX+"ED_RISK",OBJPROP_TEXT); double r=StringToDouble(v); if(r>0) g_risk_usd=r;
@@ -5012,6 +5124,7 @@ void ApplyPanelInputs()
    {
       if(!EntryLineExists()) DrawEntryLine(); ObjectSetDouble(0,OBJ_ENTRY,OBJPROP_PRICE,NormalizePrice(en));
    }
+   SavePanelInputs();
    double effectiveRisk=EffectiveRiskBudgetUsd();
    double capRisk=EquityRiskCapUsd();
 
@@ -5360,6 +5473,7 @@ int OnInit()
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(SlippagePoints);
    g_risk_usd=RiskUsd; g_fixed_lots=FixedLotsDefault; g_base_ratio=BasePositionRatioDefault; g_manual_orders=MathMax(1,ManualOrderCount); g_smart_orders=MathMax(2,SmartGridCount); g_even_rr=EvenRR; g_tp_mode=TakeProfitMode;
+   LoadPanelInputs();
    LoadTrackingState();
    LoadStabilityState();
    // 每次加载EA都处于“未确认”状态：旧框可以保留，但绝不自动排单。
@@ -5453,8 +5567,23 @@ void CleanupOrphanSmartStop()
    ChartRedraw();
 }
 
+// v1.69：定时巡检——运行中的吸筹任务，奇数槽既没有持仓也没有挂单时原位补回（同样受风险预算约束）
+void RepairOddSlots()
+{
+   if(!SmartRun24h || !g_smart_user_confirmed || !g_running || g_paused || g_recovery_pending) return;
+   if(!InfiniteOddRecycle || !BoxExists() || g_smart_slot_max<=0) return;
+   datetime now=TimeCurrent();
+   if(g_lastSlotRepair>0 && now-g_lastSlotRepair<MathMax(1,SlotRepairMinutes)*60) return;
+   g_lastSlotRepair=now;
+   for(int slot=1;slot<=g_smart_slot_max;slot+=2)
+      if(!SmartSlotOccupied(slot,true))
+         RearmOddSlot(StringFormat("%s%d",ODD_PREFIX,slot));
+}
+
 void OnTimer()
 {
+   if(g_uniPending>0 && GetTickCount64()-g_uniStartMs>5000) FinishUnifiedBatch(true);
+   RepairOddSlots();
    CleanupOrphanSmartStop();
    NewsGuardTick();
    // v1.67.4 Trading Core Lite：只刷新交易主面板。
@@ -5465,6 +5594,7 @@ void OnTimer()
 
 void OnTradeTransaction(const MqlTradeTransaction &trans,const MqlTradeRequest &request,const MqlTradeResult &result)
 {
+   if(trans.type==TRADE_TRANSACTION_REQUEST) { OnUnifiedModifyResult(request,result); return; }
    if(trans.type!=TRADE_TRANSACTION_DEAL_ADD || trans.deal==0) return;
    if(!HistoryDealSelect(trans.deal)) return; // v1.67.6：只选这一笔成交，不再每笔扫描30天历史
    ENUM_DEAL_ENTRY entry=(ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal,DEAL_ENTRY);
