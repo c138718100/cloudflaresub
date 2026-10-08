@@ -1,6 +1,6 @@
 #property strict
-#property version   "2.790"
-#property description "幽灵狙击手 - MT5黄金半自动交易与趋势过滤面板 v2.79 执行保护增强版"
+#property version   "2.800"
+#property description "幽灵狙击手 - MT5黄金半自动交易与趋势过滤面板 v2.80 执行保护增强版"
 
 #include <Trade/Trade.mqh>
 CTrade trade;
@@ -276,6 +276,8 @@ int g_offsetPts=100;
 int g_orderCount=5;
 int g_welfareTPPts=10000;
 int g_welfareLayer=0; // 0=自动中间层
+int g_maxTotalOrders=15;   // v2.80：面板可改的总单数上限（启动时取参数 MaxTotalOrders）
+double g_maxSideLots=1.0;  // v2.80：面板可改的单边手数上限（0=不限，启动时取参数 MaxSideLots）
 int hRSI=INVALID_HANDLE;
 int hADX=INVALID_HANDLE;
 int hBands15=INVALID_HANDLE,hBands25=INVALID_HANDLE,hKCEMA=INVALID_HANDLE,hKCATR=INVALID_HANDLE;
@@ -1089,7 +1091,7 @@ bool IsPendingType(ENUM_ORDER_TYPE x){return x==ORDER_TYPE_BUY_LIMIT||x==ORDER_T
 int TotalManaged(){int n=0;for(int i=PositionsTotal()-1;i>=0;i--){ulong k=PositionGetTicket(i);if(k&&PositionSelectByTicket(k)&&MatchPos())n++;}for(int i=OrdersTotal()-1;i>=0;i--){ulong k=OrderGetTicket(i);if(k&&OrderSelect(k)&&MatchOrder()&&IsPendingType((ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE)))n++;}return n;}
 double SideLots(ENUM_POSITION_TYPE ty){int n=0;double l=0,p=0,a=0;Stats(ty,n,l,p,a);return l;}
 double SidePendingLots(ENUM_ORDER_TYPE side){double l=0;for(int i=OrdersTotal()-1;i>=0;i--){ulong k=OrderGetTicket(i);if(!k||!OrderSelect(k)||!MatchOrder())continue;ENUM_ORDER_TYPE x=(ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);bool b=x==ORDER_TYPE_BUY_LIMIT||x==ORDER_TYPE_BUY_STOP||x==ORDER_TYPE_BUY_STOP_LIMIT;bool s=x==ORDER_TYPE_SELL_LIMIT||x==ORDER_TYPE_SELL_STOP||x==ORDER_TYPE_SELL_STOP_LIMIT;if((side==ORDER_TYPE_BUY&&b)||(side==ORDER_TYPE_SELL&&s))l+=OrderGetDouble(ORDER_VOLUME_CURRENT);}return l;}
-bool SideCapacityOK(ENUM_ORDER_TYPE type,double add){if(MaxSideLots<=0)return true;ENUM_POSITION_TYPE p=(type==ORDER_TYPE_BUY?POSITION_TYPE_BUY:POSITION_TYPE_SELL);if(SideLots(p)+SidePendingLots(type)+MathMax(0.0,add)>MaxSideLots+1e-8){g_status=(type==ORDER_TYPE_BUY?"多":"空")+"方向潜在总手数达到上限";return false;}return true;}
+bool SideCapacityOK(ENUM_ORDER_TYPE type,double add){if(g_maxSideLots<=0)return true;ENUM_POSITION_TYPE p=(type==ORDER_TYPE_BUY?POSITION_TYPE_BUY:POSITION_TYPE_SELL);if(SideLots(p)+SidePendingLots(type)+MathMax(0.0,add)>g_maxSideLots+1e-8){g_status=(type==ORDER_TYPE_BUY?"多":"空")+"方向潜在总手数达到上限";return false;}return true;}
 
 //---------------- direct market orders ----------------
 int ResolveWelfareLayerForTotal(int total)
@@ -1413,7 +1415,7 @@ bool Market(ENUM_ORDER_TYPE type)
 
    // “单数”表示本次总下单数；福利单如启用，占其中1笔，不额外增加。
    int requested=MathMax(1,MathMin(10,g_orderCount));
-   int roomByCount=MathMax(0,MaxTotalOrders-TotalManaged());
+   int roomByCount=MathMax(0,g_maxTotalOrders-TotalManaged());
    int target=MathMin(requested,roomByCount);
 
    if(target<=0)
@@ -1425,11 +1427,11 @@ bool Market(ENUM_ORDER_TYPE type)
 
    // 异步模式下，前一笔提交后仓位可能尚未来得及出现在Positions里。
    // 因此必须在发送前一次性预留整批单边仓位，不能在循环内逐笔扫描。
-   if(MaxSideLots>0)
+   if(g_maxSideLots>0)
    {
       ENUM_POSITION_TYPE side=(type==ORDER_TYPE_BUY?POSITION_TYPE_BUY:POSITION_TYPE_SELL);
       double used=SideLots(side)+SidePendingLots(type);
-      double remain=MathMax(0.0,MaxSideLots-used);
+      double remain=MathMax(0.0,g_maxSideLots-used);
       int byLots=(int)MathFloor(remain/lot+1e-8);
       target=MathMin(target,byLots);
 
@@ -1579,7 +1581,7 @@ int SnapshotOwnLadderPending(ulong &tickets[],double &buyLots,double &sellLots)
 int FitLadderTargetBySideCapacity(ENUM_ORDER_TYPE direction,int target,double oldBuyPendingLots,double oldSellPendingLots)
 {
    if(target<=0)return 0;
-   if(MaxSideLots<=0)return target;
+   if(g_maxSideLots<=0)return target;
 
    ENUM_POSITION_TYPE side=(direction==ORDER_TYPE_BUY?POSITION_TYPE_BUY:POSITION_TYPE_SELL);
    double used=SideLots(side)+SidePendingLots(direction);
@@ -1592,7 +1594,7 @@ int FitLadderTargetBySideCapacity(ENUM_ORDER_TYPE direction,int target,double ol
    }
 
    used=MathMax(0.0,used);
-   double remain=MathMax(0.0,MaxSideLots-used);
+   double remain=MathMax(0.0,g_maxSideLots-used);
 
    double planned=0.0;
    int allowed=0;
@@ -1669,7 +1671,7 @@ void Ladder(ENUM_ORDER_TYPE direction)
    if(ReplacePendingOnNewLadder)
       logicalManaged=MathMax(0,logicalManaged-oldPendingCount);
 
-   int room=MathMax(0,MaxTotalOrders-logicalManaged);
+   int room=MathMax(0,g_maxTotalOrders-logicalManaged);
    int target=MathMin(requested,room);
 
    if(target<=0)
@@ -3095,6 +3097,12 @@ void ApplyEdit(string key,string text)
  else if(key=="GPV"){g_gapPts=MathMax(1,v);g_status="排单间距已改为 "+IntegerToString(g_gapPts)+" 点";}
  else if(key=="CNTV"){g_orderCount=MathMax(1,MathMin(10,v));g_status="每次单数已改为 "+IntegerToString(g_orderCount);}
  else if(key=="WTV"){g_welfareTPPts=MathMax(1,v);g_status="福利单TP已改为 "+IntegerToString(g_welfareTPPts)+" 点";}
+ else if(key=="MTV"){g_maxTotalOrders=MathMax(1,v);g_status="总单数上限已改为 "+IntegerToString(g_maxTotalOrders)+" 单";}
+ else if(key=="MSV")
+ {
+    g_maxSideLots=MathMax(0.0,NormalizeDouble(d,2));
+    g_status=(g_maxSideLots>0?"单边手数上限已改为 "+DoubleToString(g_maxSideLots,2)+" 手":"单边手数上限：不限");
+ }
  else if(key=="WLV")
  {
     g_welfareLayer=(v<=0?0:MathMax(2,MathMin(10,v)));
@@ -3260,7 +3268,7 @@ void Draw()
  int panelH=1035+statShift;
 
  Rect("BG",x,y,w,panelH,C'20,22,27');
- Txt("TITLE",x+10,y+7,"幽灵狙击手  MT5 v2.79 EXEC GUARD",11,C'255,210,40');
+ Txt("TITLE",x+10,y+7,"幽灵狙击手  MT5 v2.80 EXEC GUARD",11,C'255,210,40');
  Btn("HIDE",x+345,y+5,60,20,"隐藏 O",C'55,65,80');
  Txt("MODE",x+10,y+26,"Ghost Sniper · 黄金半自动交易/趋势过滤系统",8,C'210,210,210');
 
@@ -3301,9 +3309,12 @@ void Draw()
  Txt("WLT",x+315,y+231,"层",8);
  EditBox("WLV",x+337,y+227,68,21,(g_welfareLayer<=0?"中间":IntegerToString(g_welfareLayer)));
 
- Txt("LAD",x+10,y+253,
-     "总上限："+IntegerToString(MaxTotalOrders)+
-     "  单边："+DoubleToString(MaxSideLots,2)+
+ // v2.80：总上限/单边手数可在面板直接输入
+ Txt("MTT",x+10,y+255,"总上限",8,C'230,200,80');
+ EditBox("MTV",x+58,y+251,60,20,IntegerToString(g_maxTotalOrders));
+ Txt("MST",x+126,y+255,"单边",8,C'230,200,80');
+ EditBox("MSV",x+160,y+251,60,20,(g_maxSideLots>0?DoubleToString(g_maxSideLots,2):"不限"));
+ Txt("LAD",x+226,y+255,
      "手 | 浮盈 "+DoubleToString(g_floatTriggerPct,0)+"%→普通单减仓",
      8,C'230,200,80');
 
@@ -3698,7 +3709,7 @@ void OnChartEvent(const int id,const long &lp,const double &dp,const string &sp)
    if(StringFind(sp,PX)==0)
    {
       string key=StringSubstr(sp,StringLen(PX));
-      if(key=="SLV"||key=="TPV"||key=="OFV"||key=="GPV"||key=="CNTV"||key=="WTV"||key=="WLV")
+      if(key=="SLV"||key=="TPV"||key=="OFV"||key=="GPV"||key=="CNTV"||key=="WTV"||key=="WLV"||key=="MTV"||key=="MSV")
       {
          ApplyEdit(key,ObjectGetString(0,sp,OBJPROP_TEXT));return;
       }
@@ -3707,7 +3718,7 @@ void OnChartEvent(const int id,const long &lp,const double &dp,const string &sp)
  if(id==CHARTEVENT_OBJECT_CLICK)
  {
    string a=sp;if(StringFind(a,PX)==0)a=StringSubstr(a,StringLen(PX));
-   if(a=="SLV"||a=="TPV"||a=="OFV"||a=="GPV"||a=="CNTV"||a=="WTV"||a=="WLV"){g_editFocus=true;return;}
+   if(a=="SLV"||a=="TPV"||a=="OFV"||a=="GPV"||a=="CNTV"||a=="WTV"||a=="WLV"||a=="MTV"||a=="MSV"){g_editFocus=true;return;}
    g_editFocus=false;
 
    // 先弹起按钮再执行交易，避免同步下单期间按钮看起来“卡死”。
@@ -3753,6 +3764,7 @@ int OnInit()
  g_gapPts=(g_shortMode?ShortLadderGap:LongLadderGap); if(g_gapPts<=0)g_gapPts=LadderGapPoints;
  g_offsetPts=(g_shortMode?ShortLadderOffset:LongLadderOffset); if(g_offsetPts<0)g_offsetPts=LadderOffsetPoints;
  g_orderCount=MathMax(1,MathMin(10,LadderOrders));g_welfareTPPts=WelfareTPPoints;g_welfareLayer=WelfareLayer;
+ g_maxTotalOrders=MathMax(1,MaxTotalOrders);g_maxSideLots=MathMax(0.0,MaxSideLots);
  g_welfareEnabled=EnableWelfareOrder;g_steppedTP=EnableSteppedTP;g_floatTriggerPct=FloatProfitPct;g_panelHidden=false;
  hRSI=iRSI(_Symbol,FilterTF(PERIOD_M5),RSIPeriod,PRICE_CLOSE);
  hADX=iADX(_Symbol,FilterTF(ADXTimeframe),ADXPeriod);
@@ -3767,7 +3779,7 @@ int OnInit()
 
  ChartSetInteger(0,CHART_EVENT_MOUSE_MOVE,true);
  EventSetMillisecondTimer(MathMax(250,PanelRefreshMs));
- g_status="幽灵狙击手 v2.79 就绪｜过滤周期 "+EnumToString(FilterTF(PERIOD_M5))+"｜佣金自学习+动态滑点缓冲+保护修改重试";
+ g_status="幽灵狙击手 v2.80 就绪｜过滤周期 "+EnumToString(FilterTF(PERIOD_M5))+"｜佣金自学习+动态滑点缓冲+保护修改重试";
  Draw();return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason)
