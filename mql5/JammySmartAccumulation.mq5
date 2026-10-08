@@ -1,7 +1,7 @@
 #property copyright "Jammy / OpenAI - independent MT5 port"
-#property version   "1.674"
+#property version   "1.675"
 #property strict
-#property description "Jammy Smart Accumulation MT5 v1.67.4 Trading Core Lite"
+#property description "Jammy Smart Accumulation MT5 v1.67.5 Trading Core Lite + NumPad"
 #property description "Trading core only: smart accumulation + manual market/pending manager. Heatmap/MTF dashboard moved to standalone indicator."
 
 // v1.67.3 UI变化：主面板底部信息区可折叠；状态文字拆成多行并始终留在面板背景内部。
@@ -202,6 +202,16 @@ input(name="最大滑点(点)") int SlippagePoints = 30;
 input(name="启用经纪商最小距离/冻结距离检查") bool ValidateBrokerStops = true;
 input(name="内置热图已拆分为独立指标（本项保留兼容）") bool EnableFloatingAnalyticsPanel = false;
 
+// =========================
+// 小键盘快捷键（需打开NumLock；面板显示时才生效）
+// 7多头框 8空头框 9计算吸金 +确认吸金 -停止吸金
+// 4画线止损 5计算市价 6确认市价 | 1排单线 2计算排单 3确认排单
+// .删除排单 *一键清仓(按两次) /锁仓·解锁(按两次) 0隐藏面板
+// =========================
+input group "小键盘快捷键"
+input(name="启用小键盘快捷键") bool EnableNumpadHotkeys = true;
+input(name="危险操作二次确认秒数") int HotkeyConfirmSeconds = 2;
+
 #define ORIGINAL_HIGH_PRICE_THRESHOLD 10000.0
 #define PREFIX "智能_"
 #define ODD_PREFIX "智能奇_"
@@ -357,6 +367,9 @@ ulong g_suppress_position_ids[];
 string g_status = "初始化";
 bool g_ui_hidden = false; // 小键盘0/数字0：只隐藏界面，不影响交易逻辑
 bool g_info_collapsed = false; // v1.67.3：底部信息/状态区折叠开关
+bool g_edit_focus = false;      // 正在面板输入框里打字时屏蔽快捷键
+string g_hotkey_pending = "";   // 等待二次确认的危险操作
+ulong g_hotkey_pending_ms = 0;
 
 // v1.64 稳定性：任务ID + 风险快照 + 重载识别
 long g_smart_task_id=0;
@@ -4458,24 +4471,24 @@ void BuildMainPanel()
 
    // 先给足背景高度，最后再按实际内容精确收口，避免构建过程中出现文字短暂跑出背景。
    RectLabel(UI_PREFIX+"BG",x,y,w,780,C'11,16,22');
-   Label(UI_PREFIX+"TITLE","Jammy 吞金兽 MT5 v1.67.3｜AutoRisk + Fold UI",x+8,y+6,clrDeepSkyBlue,FontSize+1);
+   Label(UI_PREFIX+"TITLE","Jammy 吞金兽 MT5 v1.67.5｜AutoRisk + NumPad",x+8,y+6,clrDeepSkyBlue,FontSize+1);
    int yy=y+28; int bw=(w-5*g)/4;
-   Button(UI_PREFIX+"LOCK","一键锁仓",x+g,yy,bw,bh,clrMaroon); Button(UI_PREFIX+"CLOSEALL","一键清仓",x+2*g+bw,yy,bw,bh,clrRed); Button(UI_PREFIX+"TRAIL","一键追踪",x+3*g+2*bw,yy,bw,bh,clrSteelBlue); Button(UI_PREFIX+"SMARTCALC","智能吸金/计算",x+4*g+3*bw,yy,bw,bh,clrPurple);
+   Button(UI_PREFIX+"LOCK","一键锁仓 [/]",x+g,yy,bw,bh,clrMaroon); Button(UI_PREFIX+"CLOSEALL","一键清仓 [*]",x+2*g+bw,yy,bw,bh,clrRed); Button(UI_PREFIX+"TRAIL","一键追踪",x+3*g+2*bw,yy,bw,bh,clrSteelBlue); Button(UI_PREFIX+"SMARTCALC","智能吸金/计算",x+4*g+3*bw,yy,bw,bh,clrPurple);
    yy+=bh+g;
    Button(UI_PREFIX+"LTP","统一多盈线",x+g,yy,bw,bh,clrDarkGreen); Button(UI_PREFIX+"LSL","统一多损线",x+2*g+bw,yy,bw,bh,clrFireBrick); Button(UI_PREFIX+"LAPPLY","确认统一多",x+3*g+2*bw,yy,bw,bh,clrSteelBlue); Button(UI_PREFIX+"DEAN","修心悟道",x+4*g+3*bw,yy,bw,bh,clrDarkGreen);
    yy+=bh+g;
    Button(UI_PREFIX+"STP","统一空盈线",x+g,yy,bw,bh,clrDarkGreen); Button(UI_PREFIX+"SSL","统一空损线",x+2*g+bw,yy,bw,bh,clrFireBrick); Button(UI_PREFIX+"SAPPLY","确认统一空",x+3*g+2*bw,yy,bw,bh,clrSteelBlue); Button(UI_PREFIX+"RISK","计算风险",x+4*g+3*bw,yy,bw,bh,clrDarkSlateBlue);
    yy+=bh+g;
    int bw3=(w-4*g)/3;
-   Button(UI_PREFIX+"BOXBUY","▲ 建立多头框",x+g,yy,bw3,bh,clrTeal); Button(UI_PREFIX+"BOXSELL","▼ 建立空头框",x+2*g+bw3,yy,bw3,bh,clrFireBrick); Button(UI_PREFIX+"PLAN","计算吸金计划",x+3*g+2*bw3,yy,bw3,bh,clrSteelBlue);
+   Button(UI_PREFIX+"BOXBUY","▲ 建立多头框 [7]",x+g,yy,bw3,bh,clrTeal); Button(UI_PREFIX+"BOXSELL","▼ 建立空头框 [8]",x+2*g+bw3,yy,bw3,bh,clrFireBrick); Button(UI_PREFIX+"PLAN","计算吸金计划 [9]",x+3*g+2*bw3,yy,bw3,bh,clrSteelBlue);
    yy+=bh+g;
-   Button(UI_PREFIX+"START","? 确认开始吸金",x+g,yy,(w-3*g)/2,bh,clrDarkGreen); Button(UI_PREFIX+"CANCELPLAN","取消吸金计划",x+2*g+(w-3*g)/2,yy,(w-3*g)/2,bh,clrSaddleBrown);
+   Button(UI_PREFIX+"START","? 确认开始吸金 [+]",x+g,yy,(w-3*g)/2,bh,clrDarkGreen); Button(UI_PREFIX+"CANCELPLAN","取消吸金计划",x+2*g+(w-3*g)/2,yy,(w-3*g)/2,bh,clrSaddleBrown);
    yy+=bh+g;
-   Button(UI_PREFIX+"DRAWSL","画线止损",x+g,yy,bw3,bh,clrMediumVioletRed); Button(UI_PREFIX+"CANCELORD","删除排单",x+2*g+bw3,yy,bw3,bh,clrGoldenrod); Button(UI_PREFIX+"CLOSELOSS","平分批损",x+3*g+2*bw3,yy,bw3,bh,clrFireBrick);
+   Button(UI_PREFIX+"DRAWSL","画线止损 [4]",x+g,yy,bw3,bh,clrMediumVioletRed); Button(UI_PREFIX+"CANCELORD","删除排单 [.]",x+2*g+bw3,yy,bw3,bh,clrGoldenrod); Button(UI_PREFIX+"CLOSELOSS","平分批损",x+3*g+2*bw3,yy,bw3,bh,clrFireBrick);
    yy+=bh+g;
-   Button(UI_PREFIX+"MKTCALC","计算市价风险",x+g,yy,(w-3*g)/2,bh,clrSteelBlue); Button(UI_PREFIX+"MKTGO","?确认市价开仓",x+2*g+(w-3*g)/2,yy,(w-3*g)/2,bh,clrDarkGreen);
+   Button(UI_PREFIX+"MKTCALC","计算市价风险 [5]",x+g,yy,(w-3*g)/2,bh,clrSteelBlue); Button(UI_PREFIX+"MKTGO","?确认市价开仓 [6]",x+2*g+(w-3*g)/2,yy,(w-3*g)/2,bh,clrDarkGreen);
    yy+=bh+g;
-   Button(UI_PREFIX+"ENTRY","设置排单线",x+g,yy,bw3,bh,clrDodgerBlue); Button(UI_PREFIX+"PENDCALC","计算排单风险",x+2*g+bw3,yy,bw3,bh,clrSteelBlue); Button(UI_PREFIX+"PENDGO","?确认排单入场",x+3*g+2*bw3,yy,bw3,bh,clrDarkGreen);
+   Button(UI_PREFIX+"ENTRY","设置排单线 [1]",x+g,yy,bw3,bh,clrDodgerBlue); Button(UI_PREFIX+"PENDCALC","计算排单风险 [2]",x+2*g+bw3,yy,bw3,bh,clrSteelBlue); Button(UI_PREFIX+"PENDGO","?确认排单入场 [3]",x+3*g+2*bw3,yy,bw3,bh,clrDarkGreen);
    yy+=bh+g;
    Button(UI_PREFIX+"CANCELMAN","取消手工计划",x+g,yy,bw3,bh,clrSaddleBrown); Button(UI_PREFIX+"CLOSEWIN","平分批盈",x+2*g+bw3,yy,bw3,bh,clrDarkGreen); Button(UI_PREFIX+"TODAY","加载CME盈亏",x+3*g+2*bw3,yy,bw3,bh,clrDimGray);
    yy+=bh+g+2;
@@ -4499,7 +4512,7 @@ void BuildMainPanel()
    Button(UI_PREFIX+"RECOVER","恢复任务",x+g,yy,(w-3*g)/2,bh,clrDarkGreen);
    Button(UI_PREFIX+"ABANDON","放弃恢复",x+2*g+(w-3*g)/2,yy,(w-3*g)/2,bh,clrDarkSlateGray);
    yy+=bh+g;
-   Button(UI_PREFIX+"STOPSMART","停止吸金",x+g,yy,(w-3*g)/2,bh,clrDimGray); Button(UI_PREFIX+"ENDALL","结束+全平",x+2*g+(w-3*g)/2,yy,(w-3*g)/2,bh,clrRed);
+   Button(UI_PREFIX+"STOPSMART","停止吸金 [-]",x+g,yy,(w-3*g)/2,bh,clrDimGray); Button(UI_PREFIX+"ENDALL","结束+全平",x+2*g+(w-3*g)/2,yy,(w-3*g)/2,bh,clrRed);
 
    // v1.67.3：这里就是用户指定的“折叠位置”。
    // 左键折叠/展开底部统计与状态；右侧可直接隐藏整个主/分析面板。
@@ -5122,8 +5135,59 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,const MqlTradeRequest &
    string gv=BaseRiskGV(posid); if(GlobalVariableCheck(gv)) GlobalVariableDel(gv);
 }
 
+// 危险操作需在 HotkeyConfirmSeconds 秒内按两次同一个键。
+bool HotkeyConfirmed(string action,string label)
+{
+   ulong now=GetTickCount64();
+   ulong window=(ulong)MathMax(1,HotkeyConfirmSeconds)*1000;
+   if(g_hotkey_pending==action && now-g_hotkey_pending_ms<=window)
+   {
+      g_hotkey_pending="";
+      return true;
+   }
+   g_hotkey_pending=action;
+   g_hotkey_pending_ms=now;
+   SetStatus(StringFormat("%s：%d秒内再按一次确认",label,MathMax(1,HotkeyConfirmSeconds)));
+   return false;
+}
+
+// 小键盘虚拟键码：Num0=96 … Num9=105，*=106，+=107，-=109，.=110，/=111
+bool HandleNumpadHotkey(int key)
+{
+   if(!EnableNumpadHotkeys || g_ui_hidden || g_edit_focus) return false;
+   if(key<97 || key>111 || key==108) return false;
+   if(key!=106 && key!=111) g_hotkey_pending="";
+
+   switch(key)
+   {
+      case 103: CreateDirectionalBox(DIR_LONG);  break;  // 7 建立多头框
+      case 104: CreateDirectionalBox(DIR_SHORT); break;  // 8 建立空头框
+      case 105: PrepareSmartPlan();              break;  // 9 计算吸金计划
+      case 107: ConfirmSmartPlan();              break;  // + 确认开始吸金
+      case 109: EndSmartStrategy();              break;  // - 停止吸金
+      case 100: DrawManualStop();                break;  // 4 画线止损
+      case 101: PrepareManualMarket();           break;  // 5 计算市价风险
+      case 102: ConfirmManualMarket();           break;  // 6 确认市价开仓
+      case 97:  DrawEntryLine();                 break;  // 1 设置排单线
+      case 98:  PrepareManualPending();          break;  // 2 计算排单风险
+      case 99:  ConfirmManualPending();          break;  // 3 确认排单入场
+      case 110: CancelAllPending();              break;  // . 删除排单
+      case 106: if(HotkeyConfirmed("CLOSEALL","一键清仓")) CloseAllStrategy(); break;  // * 一键清仓
+      case 111: if(HotkeyConfirmed("LOCK","一键锁仓/解锁")) ToggleLock();       break;  // / 锁仓/解锁
+   }
+   RefreshMainStats();
+   ChartRedraw();
+   return true;
+}
+
 void OnChartEvent(const int id,const long &lparam,const double &dparam,const string &sparam)
 {
+   // 点进面板输入框开始打字时屏蔽快捷键；结束编辑(Enter/离开输入框)或点其他按钮后恢复。
+   if(id==CHARTEVENT_OBJECT_CLICK)
+      g_edit_focus=(StringFind(sparam,UI_PREFIX+"ED_")==0);
+   else if(id==CHARTEVENT_OBJECT_ENDEDIT)
+      g_edit_focus=false;
+
    // v1.66.3：统一TP/SL线在创建后跟随鼠标。
    if(id==CHARTEVENT_MOUSE_MOVE && g_unified_follow_active)
    {
@@ -5222,9 +5286,12 @@ void OnChartEvent(const int id,const long &lparam,const double &dparam,const str
       int key=(int)lparam;
       if(key==48 || key==96)
       {
+         if(g_edit_focus) return;
          ToggleUiHidden();
          return;
       }
+      HandleNumpadHotkey(key);
+      return;
    }
 
    if(id!=CHARTEVENT_OBJECT_CLICK) return;
