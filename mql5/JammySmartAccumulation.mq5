@@ -1,7 +1,7 @@
 #property copyright "Jammy / OpenAI - independent MT5 port"
-#property version   "1.675"
+#property version   "1.676"
 #property strict
-#property description "Jammy Smart Accumulation MT5 v1.67.5 Trading Core Lite + NumPad"
+#property description "Jammy Smart Accumulation MT5 v1.67.6 Trading Core Lite + NumPad + RiskGuard"
 #property description "Trading core only: smart accumulation + manual market/pending manager. Heatmap/MTF dashboard moved to standalone indicator."
 
 // v1.67.3 UI变化：主面板底部信息区可折叠；状态文字拆成多行并始终留在面板背景内部。
@@ -45,7 +45,7 @@ input group "核心"
 input(name="以损定量 USD") double RiskUsd = 200.0;
 input(name="手工最大开仓单数") int ManualOrderCount = 10;
 input(name="单笔最大手数") double MaxLotsPerOrder = 1.0;
-input(name="单边最大总手数") double MaxTotalLots = 10.0;
+input(name="最大总手数（多空合计，含挂单）") double MaxTotalLots = 10.0;
 
 // =========================
 // 原版净值风险
@@ -67,6 +67,7 @@ input(name="智能网格间距（不建议<100）") int FixedGridGapPoints = 100
 input(name="智能网格止盈点数（默认50点）") int OddTpPoints = 100;
 input(name="默认盈亏比") double EvenRR = 2.5;
 input(name="排单有效期10根K线") int PendingValidBars = 10;
+input(name="排单有效期分钟（>0时取代K线数，不随图表周期变化）") int PendingValidMinutes = 0;
 
 // =========================
 // 止盈模式
@@ -144,6 +145,8 @@ input(name="启用吸筹+手工组合总风险上限") bool EnableCombinedRiskCa
 input(name="组合总风险上限倍数（相对生效风险预算）") double CombinedRiskCapMultiplier = 1.00;
 input(name="仅TP成交后允许循环回挂") bool RecycleOnlyOnTakeProfit = true;
 input(name="部分排单失败时撤销本轮新排单") bool RollbackPartialPendingPlan = true;
+input(name="每手往返佣金USD（计入止损风险，0=不计）") double CommissionPerLotRT = 7.0;
+input(name="当日最大亏损USD（已实现+浮动，达到后禁止新开仓，0=关闭）") double DailyMaxLossUsd = 0.0;
 
 // =========================
 // 管理范围
@@ -296,9 +299,9 @@ JsaTakeProfitMode g_tp_mode=TP_NORMAL;
 bool g_exec_smart=false;
 bool g_exec_manual_market=false;
 bool g_exec_manual_pending=false;
-datetime g_exec_last_smart=0;
-datetime g_exec_last_manual_market=0;
-datetime g_exec_last_manual_pending=0;
+ulong g_exec_last_smart=0;          // v1.67.6：真实毫秒计时，无报价时不会一直锁住
+ulong g_exec_last_manual_market=0;
+ulong g_exec_last_manual_pending=0;
 
 
 JsaDirection g_direction = DIR_LONG;
@@ -370,6 +373,23 @@ bool g_info_collapsed = false; // v1.67.3：底部信息/状态区折叠开关
 bool g_edit_focus = false;      // 正在面板输入框里打字时屏蔽快捷键
 string g_hotkey_pending = "";   // 等待二次确认的危险操作
 ulong g_hotkey_pending_ms = 0;
+#define JSA_KF_REPEAT 0x4000          // CHARTEVENT_KEYDOWN sparam：按住不放产生的自动重复
+#define JSA_MIN_DOUBLE_PRESS_MS 250   // 二次确认至少间隔，过滤“00/000”键连发和手抖
+
+// v1.67.6：吸筹计划实际使用的网格间距与最大槽位，奇数单补回必须按同一套网格。
+double g_plan_gap_price=0.0;
+int g_plan_slot_max=0;
+double g_smart_gap_price=0.0;
+int g_smart_slot_max=0;
+
+// v1.67.6：运行中拖框防误触，记录上一次合法的框位置。
+datetime g_box_t0=0,g_box_t1=0;
+double g_box_p0=0.0,g_box_p1=0.0;
+
+// v1.67.6：底仓保护的佣金缓存，避免每Tick扫描历史成交。
+ulong g_comm_cache_id[];
+double g_comm_cache_val[];
+ulong g_comm_cache_ms[];
 
 // v1.64 稳定性：任务ID + 风险快照 + 重载识别
 long g_smart_task_id=0;
@@ -767,7 +787,10 @@ double RiskPerLotAtStop(ENUM_ORDER_TYPE type,double entry,double sl,string symbo
    ENUM_ORDER_TYPE dir=IsBuyOrderType(type)?ORDER_TYPE_BUY:ORDER_TYPE_SELL;
    double p=0.0;
    if(!OrderCalcProfit(dir,symbol,1.0,entry,sl,p)) return 0.0;
-   return MathAbs(p);
+   double loss=MathAbs(p);
+   // v1.67.6：止损出场时佣金同样是亏损的一部分，计入“以损定量”。
+   if(symbol==_Symbol && CommissionPerLotRT>0) loss+=CommissionPerLotRT;
+   return loss;
 }
 
 double EffectiveRiskBudgetUsd()
@@ -1425,6 +1448,7 @@ void CreateDirectionalBox(JsaDirection dir)
    ObjectSetInteger(0,OBJ_BOX,OBJPROP_SELECTABLE,true);
    ObjectSetInteger(0,OBJ_BOX,OBJPROP_SELECTED,false);
    DrawSmartStop();
+   CacheBox();
    g_smart_plan_ready=false;
    g_smart_user_confirmed=false;
    g_smart_confirm_box_low=0.0;
@@ -1985,6 +2009,10 @@ void PrepareSmartPlan()
       }
    }
 
+   g_plan_gap_price=gp;
+   g_plan_slot_max=0;
+   for(int si=0;si<ArraySize(slots);si++) g_plan_slot_max=MathMax(g_plan_slot_max,slots[si]);
+
    g_even_batch_tp1=g_even_batch_tp2=g_even_batch_tp3=0.0;
    double even_group_risk=0.0,even_target_profit=0.0,even_actual_profit=0.0;
    bool even_tp_ok=EvenBatchTakeProfit &&
@@ -2081,8 +2109,40 @@ double ManagedDirectionalLots()
    return lots;
 }
 
+double FamilyFloatingPnL()
+{
+   double pl=0.0;
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong t=PositionGetTicket(i); if(t==0 || !IsFamilyPositionSelected()) continue;
+      pl+=PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);
+   }
+   return pl;
+}
+
+// v1.67.6：所有“新增风险”的入口共用：非对冲账户、当日亏损达到上限时一律禁止。
+bool NewRiskAllowed(string action)
+{
+   if(!IsHedgingAccount())
+   {
+      SetStatus(action+"已阻止：当前不是Hedging(对冲)账户，本EA多订单/锁仓/硬止损逻辑无法正常工作");
+      return false;
+   }
+   if(DailyMaxLossUsd>0)
+   {
+      double day=LoadTodayPnL()+FamilyFloatingPnL();
+      if(day<=-DailyMaxLossUsd)
+      {
+         SetStatus(StringFormat("%s已阻止：今日亏损$%.2f（含浮动）已达上限$%.2f",action,-day,DailyMaxLossUsd));
+         return false;
+      }
+   }
+   return true;
+}
+
 bool ExecutionSafetyCheck(string action,double add_lots=0.0,string family="")
 {
+   if(!NewRiskAllowed(action)) return false;
    int sns=0,mns=0;
    SmartRiskNow(sns); ManualRiskNow(mns);
    int bad_sl=(family=="S" ? sns : ((family=="M" || family=="P") ? mns : sns+mns));
@@ -2102,18 +2162,18 @@ bool ExecutionSafetyCheck(string action,double add_lots=0.0,string family="")
 
 bool AcquireExecutionLock(string kind)
 {
-   datetime now=TimeCurrent();
+   ulong now=GetTickCount64();
    if(kind=="S")
    {
-      if(g_exec_smart || (g_exec_last_smart>0 && now-g_exec_last_smart<2)){ SetStatus("吸筹确认处理中，请勿重复点击"); return false; }
+      if(g_exec_smart || (g_exec_last_smart>0 && now-g_exec_last_smart<2000)){ SetStatus("吸筹确认处理中，请勿重复点击"); return false; }
       g_exec_smart=true; g_exec_last_smart=now; return true;
    }
    if(kind=="M")
    {
-      if(g_exec_manual_market || (g_exec_last_manual_market>0 && now-g_exec_last_manual_market<2)){ SetStatus("市价开仓处理中，请勿重复点击"); return false; }
+      if(g_exec_manual_market || (g_exec_last_manual_market>0 && now-g_exec_last_manual_market<2000)){ SetStatus("市价开仓处理中，请勿重复点击"); return false; }
       g_exec_manual_market=true; g_exec_last_manual_market=now; return true;
    }
-   if(g_exec_manual_pending || (g_exec_last_manual_pending>0 && now-g_exec_last_manual_pending<2)){ SetStatus("排单确认处理中，请勿重复点击"); return false; }
+   if(g_exec_manual_pending || (g_exec_last_manual_pending>0 && now-g_exec_last_manual_pending<2000)){ SetStatus("排单确认处理中，请勿重复点击"); return false; }
    g_exec_manual_pending=true; g_exec_last_manual_pending=now; return true;
 }
 void ReleaseExecutionLock(string kind)
@@ -2125,6 +2185,7 @@ void ReleaseExecutionLock(string kind)
 
 bool PlaceSmartOrder(string comment,int slot,bool odd,double price,double lots)
 {
+   if(!NewRiskAllowed("吸筹下单")) return false;
    if(!SpreadAcceptable()) { SetStatus("点差过大，暂不新增排单"); return false; }
    if(EmaFilterOrders && !EmaDirectionAllowed()) return false;
    double sl=NormalizePrice(StopPrice());
@@ -2253,6 +2314,8 @@ void ConfirmSmartPlan()
    g_user_stopped_smart=false; g_smart_user_confirmed=true; g_running=true; g_paused=false;
    g_smart_confirm_box_low=BoxLow(); g_smart_confirm_box_high=BoxHigh();
    g_smart_trend_extreme=(g_direction==DIR_LONG ? CurrentAsk() : CurrentBid());
+   SetSmartGrid(g_plan_gap_price,g_plan_slot_max);
+   CacheBox();
 
    BeginSmartTask();
    SaveTaskSnapshot("S",g_smart_task_id,g_snap_risk_budget,g_snap_existing_risk,g_snap_new_risk,g_snap_total_lots,g_snap_stop);
@@ -2325,8 +2388,10 @@ void RearmOddSlot(string old_comment)
    if(!g_running || g_paused || !InfiniteOddRecycle || !BoxExists()) return;
    int slot=ExtractSlot(old_comment);
    if(slot<1 || SmartSlotOccupied(slot,true)) return;
-   int count; double gp,gpts; GridLayout(count,gp,gpts);
-   if(slot>count) return;
+   // v1.67.6：按本轮计划实际网格补回原槽位；自适应网格的间距≠固定间距。
+   double gp=g_smart_gap_price; int maxSlot=g_smart_slot_max;
+   if(gp<=0 || maxSlot<=0) { int count; double gpts; GridLayout(count,gp,gpts); maxSlot=count; }
+   if(slot>maxSlot) return;
    double target=g_direction==DIR_LONG?BoxHigh()-gp*slot:BoxLow()+gp*slot;
    target=NormalizePrice(target);
    if(!EntryInsideRiskBoundary(target)) return;
@@ -2344,6 +2409,40 @@ void RearmOddSlot(string old_comment)
    string c=StringFormat("%s%d",ODD_PREFIX,slot);
    if(PlaceSmartOrder(c,slot,true,target,lots))
       SetStatus(StringFormat("框内吸金循环：第%d槽原位补回 @ %.*f｜框不后退、不整体重排",slot,DigitsValue(),target));
+}
+
+void SetSmartGrid(double gap_price,int slot_max)
+{
+   g_smart_gap_price=gap_price;
+   g_smart_slot_max=slot_max;
+   GlobalVariableSet(StableGV("GAP"),gap_price);
+   GlobalVariableSet(StableGV("SMX"),(double)slot_max);
+}
+
+void CacheBox()
+{
+   if(!BoxExists()) return;
+   g_box_t0=(datetime)ObjectGetInteger(0,OBJ_BOX,OBJPROP_TIME,0);
+   g_box_t1=(datetime)ObjectGetInteger(0,OBJ_BOX,OBJPROP_TIME,1);
+   g_box_p0=ObjectGetDouble(0,OBJ_BOX,OBJPROP_PRICE,0);
+   g_box_p1=ObjectGetDouble(0,OBJ_BOX,OBJPROP_PRICE,1);
+}
+
+void RestoreCachedBox()
+{
+   if(!BoxExists() || g_box_p0<=0 || g_box_p1<=0) return;
+   ObjectSetInteger(0,OBJ_BOX,OBJPROP_TIME,0,g_box_t0);
+   ObjectSetInteger(0,OBJ_BOX,OBJPROP_TIME,1,g_box_t1);
+   ObjectSetDouble(0,OBJ_BOX,OBJPROP_PRICE,0,g_box_p0);
+   ObjectSetDouble(0,OBJ_BOX,OBJPROP_PRICE,1,g_box_p1);
+   DrawSmartStop();
+}
+
+// 止损边界必须仍在现价外侧，否则下一Tick就会触发硬止损清仓。
+bool BoxStopSafeNow()
+{
+   double gap=MathMax(BrokerMinDistance(),TickSizeValue());
+   return g_direction==DIR_LONG ? BoxLow()<CurrentBid()-gap : BoxHigh()>CurrentAsk()+gap;
 }
 
 void CancelSmartPending()
@@ -2369,6 +2468,12 @@ void RebuildPendingGrid(bool force=false)
    double threshold=MathMax(PointValue(),old_gp*DynamicRegridGapFraction);
    if(!force && g_last_regrid_time>0 && TimeCurrent()-g_last_regrid_time<1) return;
    if(!force && g_last_regrid_center!=0 && MathAbs(center-g_last_regrid_center)<threshold) return;
+
+   if(!NewRiskAllowed("动态推进"))
+   {
+      g_last_regrid_center=center; g_last_regrid_time=TimeCurrent();
+      return; // 旧排单保持不动
+   }
 
    g_regrid_busy=true;
 
@@ -2515,6 +2620,9 @@ void RebuildPendingGrid(bool force=false)
    int expected=ArraySize(g_smart_plan);
    CancelSmartPending();
    g_smart_equal_lots=lots;
+   int regridSlotMax=0;
+   for(int si=0;si<ArraySize(slots);si++) regridSlotMax=MathMax(regridSlotMax,slots[si]);
+   SetSmartGrid(gp,regridSlotMax);
 
    int placed=0;
    for(int k=0;k<expected;k++)
@@ -2613,6 +2721,7 @@ void UpdateDynamicBox()
    ObjectSetDouble(0,OBJ_BOX,OBJPROP_PRICE,0,NormalizePrice(p0));
    ObjectSetDouble(0,OBJ_BOX,OBJPROP_PRICE,1,NormalizePrice(p1));
    DrawSmartStop();
+   CacheBox();
 
    // 只有“趋势方向推进”发生时才允许重排未成交排单。
    RebuildPendingGrid(false);
@@ -2668,6 +2777,7 @@ void ClearSmartTaskContext()
    g_even_batch_tp3=0.0;
    ArrayResize(g_smart_plan,0);
 
+   SetSmartGrid(0.0,0);
    ObjectDelete(0,OBJ_BOX);
    ObjectDelete(0,OBJ_SMART_STOP);
    ChartRedraw();
@@ -2740,15 +2850,17 @@ bool TryAutoResumeSmart()
 
 void ExpireSmartOrders()
 {
-   if(PendingValidBars<=0) return;
+   if(PendingValidBars<=0 && PendingValidMinutes<=0) return;
    ExpireItem arr[]; ArrayResize(arr,0);
    for(int i=OrdersTotal()-1;i>=0;i--)
    {
       ulong t=OrderGetTicket(i); if(t==0 || !IsFamilyOrderSelected()) continue;
       string c=OrderGetString(ORDER_COMMENT); if(!IsSmartComment(c)) continue;
       datetime setup=(datetime)OrderGetInteger(ORDER_TIME_SETUP);
-      int shift=iBarShift(_Symbol,_Period,setup,false);
-      if(shift>=PendingValidBars)
+      bool expired=(PendingValidMinutes>0
+                    ? TimeCurrent()-setup>=(datetime)PendingValidMinutes*60
+                    : iBarShift(_Symbol,_Period,setup,false)>=PendingValidBars);
+      if(expired)
       {
          int n=ArraySize(arr); ArrayResize(arr,n+1); arr[n].ticket=t; arr[n].comment=c; arr[n].odd=IsOddComment(c);
       }
@@ -3029,6 +3141,8 @@ void LoadStabilityState()
    if(GlobalVariableCheck(StableGV("TL")))  g_snap_total_lots=GlobalVariableGet(StableGV("TL"));
    if(GlobalVariableCheck(StableGV("SP")))  g_snap_stop=GlobalVariableGet(StableGV("SP"));
    if(GlobalVariableCheck(StableGV("TM")))  g_snap_time=(datetime)GlobalVariableGet(StableGV("TM"));
+   if(GlobalVariableCheck(StableGV("GAP"))) g_smart_gap_price=GlobalVariableGet(StableGV("GAP"));
+   if(GlobalVariableCheck(StableGV("SMX"))) g_smart_slot_max=(int)GlobalVariableGet(StableGV("SMX"));
 }
 
 void SaveRiskSnapshot(double budget,double existing_risk,double new_risk,double total_lots,double stop)
@@ -3468,6 +3582,7 @@ void RearmManualTracking()
 
    // 独立于吸金框：停止框内吸金不会关闭这里。
    if(!ManualSmartTracking || !g_manual_tracking_active) return;
+   if(!NewRiskAllowed("手工循环回挂")) return;
    // 市价首批循环必须由“一键追踪”明确开启；吸筹系统完全不参与。
    if(g_manual_tracking_source_mode==1 && (!MarketCycleTracking || !g_one_key_trailing)) return;
    if(g_manual_tracking_source_mode==2 && !PendingCycleTracking) return;
@@ -3536,6 +3651,26 @@ double PositionCommissionCost(ulong pos_id)
    return MathAbs(c);
 }
 
+double CachedPositionCommission(ulong pos_id)
+{
+   ulong now=GetTickCount64();
+   int n=ArraySize(g_comm_cache_id);
+   for(int i=0;i<n;i++)
+      if(g_comm_cache_id[i]==pos_id && now-g_comm_cache_ms[i]<60000) return g_comm_cache_val[i];
+
+   double v=PositionCommissionCost(pos_id);
+   int idx=-1;
+   for(int i=0;i<n;i++) if(g_comm_cache_id[i]==pos_id) { idx=i; break; }
+   if(idx<0)
+   {
+      if(n>=64) { ArrayResize(g_comm_cache_id,0); ArrayResize(g_comm_cache_val,0); ArrayResize(g_comm_cache_ms,0); n=0; }
+      idx=n; ArrayResize(g_comm_cache_id,n+1); ArrayResize(g_comm_cache_val,n+1); ArrayResize(g_comm_cache_ms,n+1);
+      g_comm_cache_id[idx]=pos_id;
+   }
+   g_comm_cache_val[idx]=v; g_comm_cache_ms[idx]=now;
+   return v;
+}
+
 double MoneyPerPrice(double volume)
 {
    double tickval=SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE_LOSS);
@@ -3553,7 +3688,8 @@ double CostAwareBreakEven(ulong ticket)
    ulong id=(ulong)PositionGetInteger(POSITION_IDENTIFIER);
    double mpp=MoneyPerPrice(vol); if(mpp<=0) return entry;
    double spread=MathMax(0.0,CurrentAsk()-CurrentBid());
-   double commission=PositionCommissionCost(id)*CommissionProtectMultiplier;
+   // v1.67.6：持仓中只扣了开仓佣金，平仓佣金还没发生；按往返估算，并不低于参数里的每手往返佣金。
+   double commission=MathMax(CachedPositionCommission(id)*2.0,CommissionPerLotRT*vol)*CommissionProtectMultiplier;
    double swap=MathMax(0.0,-PositionGetDouble(POSITION_SWAP));
    double extra=BaseProtectExtraPoints*PointValue();
    double cost_price=(spread*mpp+commission+swap)/mpp+extra;
@@ -3660,6 +3796,7 @@ void ToggleLock()
       int ok=0; for(int i=0;i<ArraySize(locktickets);i++) if(ClosePositionTicket(locktickets[i])) ok++;
       SetStatus(StringFormat("已解锁：%d笔",ok)); return;
    }
+   if(!IsHedgingAccount()) { SetStatus("锁仓已阻止：非对冲账户反向开单会直接平仓，不是锁仓"); return; }
    double net=buy-sell; double minv=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
    if(MathAbs(net)<minv) { SetStatus("无需锁仓：净头寸接近0"); return; }
    double lots=NormalizeLotsDown(MathAbs(net));
@@ -4471,7 +4608,7 @@ void BuildMainPanel()
 
    // 先给足背景高度，最后再按实际内容精确收口，避免构建过程中出现文字短暂跑出背景。
    RectLabel(UI_PREFIX+"BG",x,y,w,780,C'11,16,22');
-   Label(UI_PREFIX+"TITLE","Jammy 吞金兽 MT5 v1.67.5｜AutoRisk + NumPad",x+8,y+6,clrDeepSkyBlue,FontSize+1);
+   Label(UI_PREFIX+"TITLE","Jammy 吞金兽 MT5 v1.67.6｜AutoRisk + NumPad",x+8,y+6,clrDeepSkyBlue,FontSize+1);
    int yy=y+28; int bw=(w-5*g)/4;
    Button(UI_PREFIX+"LOCK","一键锁仓 [/]",x+g,yy,bw,bh,clrMaroon); Button(UI_PREFIX+"CLOSEALL","一键清仓 [*]",x+2*g+bw,yy,bw,bh,clrRed); Button(UI_PREFIX+"TRAIL","一键追踪",x+3*g+2*bw,yy,bw,bh,clrSteelBlue); Button(UI_PREFIX+"SMARTCALC","智能吸金/计算",x+4*g+3*bw,yy,bw,bh,clrPurple);
    yy+=bh+g;
@@ -5034,7 +5171,7 @@ int OnInit()
    g_smart_user_confirmed=false;
    g_running=false;
    g_paused=false;
-   if(BoxExists()) { g_direction_prepared=true; DrawSmartStop(); }
+   if(BoxExists()) { g_direction_prepared=true; DrawSmartStop(); CacheBox(); }
    ObjectDelete(0,RESTORE_UI_OBJ);
    BuildMainPanel(); // v1.67.4：热图/共振已拆分为独立指标，不在交易EA中加载
 
@@ -5096,7 +5233,7 @@ void OnTimer()
 void OnTradeTransaction(const MqlTradeTransaction &trans,const MqlTradeRequest &request,const MqlTradeResult &result)
 {
    if(trans.type!=TRADE_TRANSACTION_DEAL_ADD || trans.deal==0) return;
-   HistorySelect(TimeCurrent()-30*86400,TimeCurrent()+60);
+   if(!HistoryDealSelect(trans.deal)) return; // v1.67.6：只选这一笔成交，不再每笔扫描30天历史
    ENUM_DEAL_ENTRY entry=(ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal,DEAL_ENTRY);
    ulong posid=(ulong)HistoryDealGetInteger(trans.deal,DEAL_POSITION_ID);
    if(entry==DEAL_ENTRY_IN)
@@ -5140,6 +5277,8 @@ bool HotkeyConfirmed(string action,string label)
 {
    ulong now=GetTickCount64();
    ulong window=(ulong)MathMax(1,HotkeyConfirmSeconds)*1000;
+   // 间隔太短（“00”键连发/双击过快）不算第二次确认，保留第一次的等待状态。
+   if(g_hotkey_pending==action && now-g_hotkey_pending_ms<JSA_MIN_DOUBLE_PRESS_MS) return false;
    if(g_hotkey_pending==action && now-g_hotkey_pending_ms<=window)
    {
       g_hotkey_pending="";
@@ -5231,6 +5370,15 @@ void OnChartEvent(const int id,const long &lparam,const double &dparam,const str
 
       if(sparam==OBJ_BOX)
       {
+         // v1.67.6：运行中把止损边界拖过现价，会在下一Tick直接触发硬止损清仓，撤销这次拖动。
+         if(g_smart_user_confirmed && g_running && !BoxStopSafeNow())
+         {
+            RestoreCachedBox();
+            ChartRedraw();
+            SetStatus("拖框已撤销：止损边界不能越过现价（否则会立即触发硬止损清仓）");
+            return;
+         }
+         CacheBox();
          DrawSmartStop(); g_smart_plan_ready=false; ArrayResize(g_smart_plan,0);
          if(g_smart_user_confirmed && g_running && !g_paused && DynamicRegridPendingOrders)
          {
@@ -5284,6 +5432,8 @@ void OnChartEvent(const int id,const long &lparam,const double &dparam,const str
    if(id==CHARTEVENT_KEYDOWN)
    {
       int key=(int)lparam;
+      // 按住不放的自动重复一律忽略：防止按住 * 或 / 被当成“按两次确认”。
+      if(((int)StringToInteger(sparam) & JSA_KF_REPEAT)!=0) return;
       if(key==48 || key==96)
       {
          if(g_edit_focus) return;
@@ -5304,11 +5454,14 @@ void OnChartEvent(const int id,const long &lparam,const double &dparam,const str
    }
 
    ObjectSetInteger(0,sparam,OBJPROP_STATE,false);
+   if(sparam!=UI_PREFIX+"LOCK" && sparam!=UI_PREFIX+"CLOSEALL" && sparam!=UI_PREFIX+"ENDALL")
+      g_hotkey_pending="";
 
    if(sparam==UI_PREFIX+"FOLDINFO") { ToggleInfoCollapsed(); return; }
    else if(sparam==UI_PREFIX+"HIDEUI") { ToggleUiHidden(); return; }
-   else if(sparam==UI_PREFIX+"LOCK") ToggleLock();
-   else if(sparam==UI_PREFIX+"CLOSEALL" || sparam==UI_PREFIX+"ENDALL") CloseAllStrategy();
+   // v1.67.6：清仓、结束+全平、锁仓/解锁都要在设定秒数内点两次。
+   else if(sparam==UI_PREFIX+"LOCK") { if(HotkeyConfirmed("LOCK","一键锁仓/解锁")) ToggleLock(); }
+   else if(sparam==UI_PREFIX+"CLOSEALL" || sparam==UI_PREFIX+"ENDALL") { if(HotkeyConfirmed("CLOSEALL","一键清仓/结束+全平")) CloseAllStrategy(); }
    else if(sparam==UI_PREFIX+"TRAIL") ToggleOneKeyTrailing();
    else if(sparam==UI_PREFIX+"SMARTCALC" || sparam==UI_PREFIX+"PLAN") PrepareSmartPlan();
    else if(sparam==UI_PREFIX+"LTP") PrepareUnifiedLine(true,true);
