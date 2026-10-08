@@ -1,7 +1,7 @@
 #property copyright "Jammy / OpenAI - independent MT5 port"
-#property version   "1.680"
+#property version   "1.681"
 #property strict
-#property description "Jammy Smart Accumulation MT5 v1.68.0 Trading Core Lite + NumPad + RiskGuard"
+#property description "Jammy Smart Accumulation MT5 v1.68.1 Trading Core Lite + NumPad + RiskGuard"
 #property description "Trading core only: smart accumulation + manual market/pending manager. Heatmap/MTF dashboard moved to standalone indicator."
 
 // v1.67.3 UI变化：主面板底部信息区可折叠；状态文字拆成多行并始终留在面板背景内部。
@@ -160,7 +160,7 @@ input(name="硬止损需收盘确认跌破/升破框边（关=碰框边即清仓
 input(name="收盘确认周期") ENUM_TIMEFRAMES HardStopConfirmTF = PERIOD_M15;
 
 input group "v1.68 新闻暂停（MT5经济日历）"
-input(name="高影响数据前后暂停自动补单/重排/循环") bool NewsPauseEnable = true;
+input(name="高影响数据前后暂停自动补单/重排/循环") bool NewsPauseEnable = false;
 input(name="新闻货币") string NewsCurrency = "USD";
 input(name="公布前暂停分钟") int NewsPauseBeforeMin = 15;
 input(name="公布后暂停分钟") int NewsPauseAfterMin = 15;
@@ -2533,6 +2533,31 @@ void SetSmartGrid(double gap_price,int slot_max)
    g_smart_slot_max=slot_max;
    GlobalVariableSet(StableGV("GAP"),gap_price);
    GlobalVariableSet(StableGV("SMX"),(double)slot_max);
+   // v1.68.1：方向和统一手数也要记住，否则重载后空头任务会被当成多头、补单手数失控
+   GlobalVariableSet(StableGV("DIR"),(double)g_direction);
+   GlobalVariableSet(StableGV("EQL"),g_smart_equal_lots);
+}
+
+// 从现有吸筹持仓/挂单推断方向：只有买单=多头，只有卖单=空头，否则返回false
+bool InferSmartDirection(JsaDirection &dir)
+{
+   int buy=0,sell=0;
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong t=PositionGetTicket(i); if(t==0 || PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+      if(!IsSmartComment(PositionGetString(POSITION_COMMENT))) continue;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY) buy++; else sell++;
+   }
+   for(int i=OrdersTotal()-1;i>=0;i--)
+   {
+      ulong t=OrderGetTicket(i); if(t==0 || OrderGetString(ORDER_SYMBOL)!=_Symbol) continue;
+      if(!IsSmartComment(OrderGetString(ORDER_COMMENT))) continue;
+      ENUM_ORDER_TYPE ot=(ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      if(IsBuyOrderType(ot)) buy++; else if(IsSellOrderType(ot)) sell++;
+   }
+   if(buy>0 && sell==0) { dir=DIR_LONG;  return true; }
+   if(sell>0 && buy==0) { dir=DIR_SHORT; return true; }
+   return false;
 }
 
 void CacheBox()
@@ -3276,6 +3301,8 @@ void LoadStabilityState()
    if(GlobalVariableCheck(StableGV("GAP"))) g_smart_gap_price=GlobalVariableGet(StableGV("GAP"));
    if(GlobalVariableCheck(StableGV("SMX"))) g_smart_slot_max=(int)GlobalVariableGet(StableGV("SMX"));
    if(GlobalVariableCheck(StableGV("SBF"))) g_stop_buffer=GlobalVariableGet(StableGV("SBF"));
+   if(GlobalVariableCheck(StableGV("EQL"))) g_smart_equal_lots=GlobalVariableGet(StableGV("EQL"));
+   if(GlobalVariableCheck(StableGV("DIR"))) g_direction=(GlobalVariableGet(StableGV("DIR"))>0.5?DIR_SHORT:DIR_LONG);
 }
 
 void SaveRiskSnapshot(double budget,double existing_risk,double new_risk,double total_lots,double stop)
@@ -3369,12 +3396,46 @@ void LoadRecoveryRuntimeState()
 void ResumeRecoveredTasks()
 {
    if(!g_recovery_pending){ SetStatus("当前没有待恢复任务"); return; }
-   g_running=g_recover_smart_was_running;
-   g_smart_user_confirmed=g_recover_smart_was_running;
+
+   // v1.68.1：用户主动点“恢复任务”时，只要吸金框还在且有吸筹单，就恢复吸金运行，
+   // 不再因为上次退出时保存的运行标记为关而“保持停止”。
+   JsaDirection d;
+   bool hasSmart=InferSmartDirection(d);
+   bool resumeSmart=BoxExists() && (g_recover_smart_was_running || hasSmart);
+   if(hasSmart) g_direction=d;
+
+   g_running=resumeSmart;
+   g_smart_user_confirmed=resumeSmart;
+   g_paused=false;
    g_manual_tracking_active=g_recover_manual_was_active;
    g_one_key_trailing=g_recover_onekey_was_on;
    g_recovery_pending=false;
    SaveRecoveryRuntimeState();
+
+   if(resumeSmart)
+   {
+      g_direction_prepared=true;
+      g_smart_trend_extreme=0.0;     // 从当前价重新跟踪趋势极值
+      // 旧版本建立的任务没有记录止损缓冲：按现有吸筹单的实际SL反推，保持整轮止损一致
+      if(g_stop_buffer<=0)
+      {
+         double edge=BoxEdgeStop(), b=-1.0;
+         for(int i=PositionsTotal()-1;i>=0;i--)
+         {
+            ulong t=PositionGetTicket(i); if(t==0 || PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+            if(!IsSmartComment(PositionGetString(POSITION_COMMENT))) continue;
+            double sl=PositionGetDouble(POSITION_SL); if(sl<=0) continue;
+            double gap=(g_direction==DIR_LONG ? edge-sl : sl-edge);
+            if(gap>=0) b=MathMax(b,gap);
+         }
+         if(b>=0) g_stop_buffer=MathMax(b,1e-9);   // 1e-9 = 贴框边，但仍视为“已冻结”
+         GlobalVariableSet(StableGV("SBF"),g_stop_buffer);
+      }
+      DrawSmartStop();
+      CacheBox();
+      SetSmartGrid(g_smart_gap_price,g_smart_slot_max);
+      RebuildPendingGrid(true);       // 按当前框把未成交挂单重新对齐/补齐
+   }
    SetStatus(StringFormat("恢复完成：吸筹%s｜手工循环%s｜一键追踪%s｜不重复建仓/挂单",
       g_running?"继续":"保持停止",g_manual_tracking_active?"继续":"保持停止",g_one_key_trailing?"开启":"关闭"));
 }
@@ -4742,7 +4803,7 @@ void BuildMainPanel()
 
    // 先给足背景高度，最后再按实际内容精确收口，避免构建过程中出现文字短暂跑出背景。
    RectLabel(UI_PREFIX+"BG",x,y,w,780,C'11,16,22');
-   Label(UI_PREFIX+"TITLE","Jammy 吞金兽 MT5 v1.68｜Auction + NumPad",x+8,y+6,clrDeepSkyBlue,FontSize+1);
+   Label(UI_PREFIX+"TITLE","Jammy 吞金兽 MT5 v1.68.1｜Auction + NumPad",x+8,y+6,clrDeepSkyBlue,FontSize+1);
    int yy=y+28; int bw=(w-5*g)/4;
    Button(UI_PREFIX+"LOCK","一键锁仓 [/]",x+g,yy,bw,bh,clrMaroon); Button(UI_PREFIX+"CLOSEALL","一键清仓 [*]",x+2*g+bw,yy,bw,bh,clrRed); Button(UI_PREFIX+"TRAIL","一键追踪",x+3*g+2*bw,yy,bw,bh,clrSteelBlue); Button(UI_PREFIX+"SMARTCALC","智能吸金/计算",x+4*g+3*bw,yy,bw,bh,clrPurple);
    yy+=bh+g;
@@ -5305,7 +5366,12 @@ int OnInit()
    g_smart_user_confirmed=false;
    g_running=false;
    g_paused=false;
-   if(BoxExists()) { g_direction_prepared=true; DrawSmartStop(); CacheBox(); }
+   if(BoxExists())
+   {
+      JsaDirection d;
+      if(InferSmartDirection(d)) g_direction=d;   // 有吸筹单时以实际单子方向为准
+      g_direction_prepared=true; DrawSmartStop(); CacheBox();
+   }
    else ObjectDelete(0,OBJ_SMART_STOP);   // 上次残留的孤立止损线
    ObjectDelete(0,RESTORE_UI_OBJ);
    BuildMainPanel(); // v1.67.4：热图/共振已拆分为独立指标，不在交易EA中加载
