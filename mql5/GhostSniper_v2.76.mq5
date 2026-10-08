@@ -1,6 +1,6 @@
 #property strict
-#property version   "2.830"
-#property description "幽灵狙击手 - MT5黄金半自动交易与趋势过滤面板 v2.83 自动参数版"
+#property version   "2.840"
+#property description "幽灵狙击手 - MT5黄金半自动交易与趋势过滤面板 v2.84 自动盈亏比版"
 
 #include <Trade/Trade.mqh>
 CTrade trade;
@@ -171,7 +171,16 @@ input bool         UnifiedTPExcludeWelfare = true; // 统一TP默认排除福利
 
 input group "=== v2.81 自动参数（按品种波动/点差自动计算） ==="
 input bool   EnableAutoParams      = true;  // 启动时开启自动参数（面板“自动参数”按钮可随时开关）
-input double AutoSLATRH1           = 1.0;   // 止损 = H1 ATR × 此倍数
+input bool   AutoRRMode            = true;  // 盈亏比模式：止损按波动，止盈 = 止损 × 盈亏比（关=旧的小止盈大止损算法）
+input double AutoRRMin             = 1.5;   // 第1单的盈亏比（止盈/止损）
+input double AutoRRMax             = 2.0;   // 最后一单的盈亏比（排单止盈开启时各单在 Min~Max 之间递增）
+input double AutoSLScalpATR        = 1.2;   // 盈亏比模式·抢钱：止损 = M5 ATR × 此倍数
+input double AutoSLSniperATR       = 1.2;   // 盈亏比模式·狙击：止损 = M15 ATR × 此倍数
+input double AutoRR_BE             = 1.0;   // 盈亏比模式：净浮盈达到 止损×此倍数(=1R) 推保本
+input double AutoRR_TrailStart     = 1.2;   // 盈亏比模式：净浮盈达到 1.2R 开始追踪
+input double AutoRR_TrailDist      = 0.8;   // 盈亏比模式：追踪距离 = 0.8R
+input double AutoRR_TrailStep      = 0.2;   // 盈亏比模式：追踪步距 = 0.2R
+input double AutoSLATRH1           = 1.0;   // （非盈亏比模式）止损 = H1 ATR × 此倍数
 input double AutoTPScalp           = 0.40;  // 抢钱：首级止盈 = M5 ATR × 此倍数
 input double AutoTPSniper          = 0.67;  // 狙击：首级止盈 = M15 ATR × 此倍数
 input double AutoGapScalp          = 0.40;  // 抢钱：排单间距/偏移 = M5 ATR × 此倍数
@@ -690,7 +699,22 @@ color TrendLightColor(int s)
 }
 int ModeTP(){return g_tpPts;} int ModeGap(){return g_gapPts;} int ModeOffset(){return g_offsetPts;}
 int StepTPBase(){int v=ModeTP();if(v<=0)v=g_tpPts;return MathMax(1,v);}
-double SteppedTPPrice(ENUM_ORDER_TYPE type,double entry,int index){int d=StepTPBase()*(g_steppedTP?index+1:1);return NormalizeDouble(type==ORDER_TYPE_BUY?entry+d*_Point:entry-d*_Point,_Digits);}
+bool RRModeActive(){return g_autoParams && AutoRRMode && g_slPts>0;}
+// 第 index 单的盈亏比：排单止盈开启时在 AutoRRMin~AutoRRMax 之间均匀递增，否则都用 AutoRRMin
+double LayerRR(int index)
+{
+   int n=MathMax(1,g_orderCount);
+   double lo=MathMax(0.1,AutoRRMin), hi=MathMax(lo,AutoRRMax);
+   if(!g_steppedTP || n<=1) return lo;
+   return lo+(hi-lo)*MathMin(1.0,(double)index/(n-1));
+}
+double SteppedTPPrice(ENUM_ORDER_TYPE type,double entry,int index)
+{
+   int d;
+   if(RRModeActive()) d=(int)MathRound(g_slPts*LayerRR(index));          // v2.84：止盈 = 止损 × 盈亏比
+   else d=StepTPBase()*(g_steppedTP?index+1:1);
+   return NormalizeDouble(type==ORDER_TYPE_BUY?entry+d*_Point:entry-d*_Point,_Digits);
+}
 
 //---------------- HTF H1/H4/7H 趋势引擎 ----------------
 int RequiredHTFBars()
@@ -3312,7 +3336,7 @@ void Draw()
  int panelH=1055+statShift;
 
  Rect("BG",x,y,w,panelH,C'20,22,27');
- Txt("TITLE",x+10,y+7,"幽灵狙击手  MT5 v2.83 AUTO ADAPT",11,C'255,210,40');
+ Txt("TITLE",x+10,y+7,"幽灵狙击手  MT5 v2.84 AUTO RR",11,C'255,210,40');
  Btn("HIDE",x+345,y+5,60,20,"隐藏 O",C'55,65,80');
  Txt("MODE",x+10,y+26,"Ghost Sniper · 黄金半自动交易/趋势过滤系统",8,C'210,210,210');
 
@@ -3844,7 +3868,7 @@ int OnInit()
 
  ChartSetInteger(0,CHART_EVENT_MOUSE_MOVE,true);
  EventSetMillisecondTimer(MathMax(250,PanelRefreshMs));
- g_status="幽灵狙击手 v2.83 就绪｜过滤周期 "+EnumToString(FilterTF(PERIOD_M5))+"｜佣金自学习+动态滑点缓冲+保护修改重试";
+ g_status="幽灵狙击手 v2.84 就绪｜过滤周期 "+EnumToString(FilterTF(PERIOD_M5))+"｜佣金自学习+动态滑点缓冲+保护修改重试";
  Draw();return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason)
@@ -4022,12 +4046,28 @@ void RecalcAutoParams(bool force)
    int gap=(int)MathRound(MathMax((sc?a5*AutoGapScalp:a15*AutoGapSniper),MathMax(spr*2.0,minDist)));
    int sl=(int)MathRound(MathMax(a60*AutoSLATRH1,MathMax(tp*2.0,minDist*3)));
 
+   if(AutoRRMode)
+   {
+      // v2.84 盈亏比模式：止损按入场周期的波动定，止盈 = 止损 × 盈亏比；保护按 R 设置
+      double slb=(sc ? a5*AutoSLScalpATR : a15*AutoSLSniperATR);
+      sl=(int)MathRound(MathMax(slb,MathMax(cost*4.0,minDist*3)));
+      tp=(int)MathRound(sl*MathMax(0.1,AutoRRMin));
+      g_tpPts=tp; g_gapPts=gap; g_offsetPts=gap; g_slPts=sl;
+      g_beTrig   =(int)MathRound(MathMax(sl*AutoRR_BE,cost*2.0));
+      g_bePlus   =(int)MathRound(MathMax(sl*0.10,spr));
+      g_trailTrig=(int)MathRound(MathMax(sl*AutoRR_TrailStart,g_beTrig+spr));
+      g_trailDist=(int)MathRound(MathMax(sl*AutoRR_TrailDist,MathMax(spr*2.0,minDist)));
+      g_trailStep=(int)MathRound(MathMax(sl*AutoRR_TrailStep,spr*0.5));
+   }
+   else
+   {
    g_tpPts=tp; g_gapPts=gap; g_offsetPts=gap; g_slPts=sl;
    g_beTrig   =(int)MathRound(MathMax(base*AutoBE,cost*2.0));
    g_bePlus   =(int)MathRound(MathMax(base*AutoBEPlus,spr*0.5));
    g_trailTrig=(int)MathRound(MathMax(base*AutoTrailStart,g_beTrig*1.5));
    g_trailDist=(int)MathRound(MathMax(base*AutoTrailDist,MathMax(spr*2.0,minDist)));
    g_trailStep=(int)MathRound(MathMax(base*AutoTrailStep,spr*0.5));
+   }
    g_wTrailStart=(int)MathRound(a15*AutoWelfareStart);
    g_wTrailDist =(int)MathRound(MathMax(a15*AutoWelfareDist,spr*2.0));
    g_wTrailStep =(int)MathRound(MathMax(a15*AutoWelfareStep,spr*0.5));
@@ -4050,8 +4090,10 @@ void RecalcAutoParams(bool force)
       lotTxt=StringFormat("｜手数 %.2f(风险%.1f%%=$%.0f)",g_lot,RiskPercentPerBatch,riskMoney)+lotTxt;
    }
 
-   g_autoInfo=StringFormat("自动[%s·%s] ATR5/15/60 %.0f/%.0f/%.0f 点差%.0f｜SL%d TP%d 距%d 福利TP%d%s｜保本%d 追%d/%d%s",
-                           SymbolClassText(),sc?"抢钱":"狙击",a5,a15,a60,spr,sl,tp,gap,g_welfareTPPts,g_welfareTPManual?"(手动)":"",
+   g_autoInfo=StringFormat("自动[%s·%s] ATR5/15/60 %.0f/%.0f/%.0f 点差%.0f｜SL%d TP%d%s 距%d 福利TP%d%s｜保本%d 追%d/%d%s",
+                           SymbolClassText(),sc?"抢钱":"狙击",a5,a15,a60,spr,sl,tp,
+                           AutoRRMode?StringFormat("(RR %.1f~%.1f)",AutoRRMin,(g_steppedTP?MathMax(AutoRRMin,AutoRRMax):AutoRRMin)):"",
+                           gap,g_welfareTPPts,g_welfareTPManual?"(手动)":"",
                            g_beTrig,g_trailTrig,g_trailDist,lotTxt);
 }
 
