@@ -1,6 +1,6 @@
 #property strict
-#property version   "2.810"
-#property description "幽灵狙击手 - MT5黄金半自动交易与趋势过滤面板 v2.81 自动参数版"
+#property version   "2.820"
+#property description "幽灵狙击手 - MT5黄金半自动交易与趋势过滤面板 v2.82 自动参数版"
 
 #include <Trade/Trade.mqh>
 CTrade trade;
@@ -182,6 +182,7 @@ input double AutoBEPlus            = 0.12;  // 保本加点 = 基准ATR × 此�
 input double AutoTrailStart        = 1.20;  // 追踪启动 = 基准ATR × 此倍数
 input double AutoTrailDist         = 1.00;  // 追踪距离 = 基准ATR × 此倍数
 input double AutoTrailStep         = 0.32;  // 追踪步距 = 基准ATR × 此倍数
+input double AutoWelfareTPH1       = 5.0;   // 福利单止盈 = H1 ATR × 此倍数（黄金H1 ATR约2000点时≈10000点）
 input double AutoWelfareStart      = 1.30;  // 福利单跟踪启动 = M15 ATR × 此倍数
 input double AutoWelfareDist       = 0.78;  // 福利单跟踪距离 = M15 ATR × 此倍数
 input double AutoWelfareStep       = 0.22;  // 福利单跟踪步距 = M15 ATR × 此倍数
@@ -303,6 +304,7 @@ int g_beTrig=100,g_bePlus=30,g_trailTrig=300,g_trailDist=200,g_trailStep=50;
 int g_wTrailStart=600,g_wTrailDist=350,g_wTrailStep=100,g_maxSpread=120;
 bool g_autoParams=true;
 bool g_autoReady=false;
+bool g_welfareTPManual=false;   // 面板手动改过福利TP → 自动不再覆盖，直到重新开启自动参数
 datetime g_autoLastBar=0;
 string g_autoInfo="自动参数：等待数据";
 int hAtrM5=INVALID_HANDLE,hAtrM15=INVALID_HANDLE,hAtrH1=INVALID_HANDLE;
@@ -3128,7 +3130,7 @@ void ApplyEdit(string key,string text)
  else if(key=="OFV"){g_offsetPts=MathMax(0,v);g_status="排单偏移已改为 "+IntegerToString(g_offsetPts)+" 点";}
  else if(key=="GPV"){g_gapPts=MathMax(1,v);g_status="排单间距已改为 "+IntegerToString(g_gapPts)+" 点";}
  else if(key=="CNTV"){g_orderCount=MathMax(1,MathMin(10,v));g_status="每次单数已改为 "+IntegerToString(g_orderCount);}
- else if(key=="WTV"){g_welfareTPPts=MathMax(1,v);g_status="福利单TP已改为 "+IntegerToString(g_welfareTPPts)+" 点";}
+ else if(key=="WTV"){g_welfareTPPts=MathMax(1,v);g_welfareTPManual=true;g_status="福利单TP已改为 "+IntegerToString(g_welfareTPPts)+" 点"+(g_autoParams?"（福利TP改为手动，其它仍自动）":"");}
  else if(key=="MTV"){g_maxTotalOrders=MathMax(1,v);g_status="总单数上限已改为 "+IntegerToString(g_maxTotalOrders)+" 单";}
  else if(key=="MSV")
  {
@@ -3301,7 +3303,7 @@ void Draw()
  int panelH=1055+statShift;
 
  Rect("BG",x,y,w,panelH,C'20,22,27');
- Txt("TITLE",x+10,y+7,"幽灵狙击手  MT5 v2.81 AUTO ADAPT",11,C'255,210,40');
+ Txt("TITLE",x+10,y+7,"幽灵狙击手  MT5 v2.82 AUTO ADAPT",11,C'255,210,40');
  Btn("HIDE",x+345,y+5,60,20,"隐藏 O",C'55,65,80');
  Txt("MODE",x+10,y+26,"Ghost Sniper · 黄金半自动交易/趋势过滤系统",8,C'210,210,210');
 
@@ -3638,7 +3640,7 @@ void Action(string a)
  else if(a=="AUTO")
  {
    g_autoParams=!g_autoParams;
-   if(g_autoParams){ RecalcAutoParams(true); g_status="自动参数已开启：按本品种ATR与点差实时计算"; }
+   if(g_autoParams){ g_welfareTPManual=false; RecalcAutoParams(true); g_status="自动参数已开启：按本品种ATR与点差实时计算（含福利TP）"; }
    else
    {
       // 关闭自动：保护参数回到输入值，止损/止盈/间距保持当前数值，可在面板手动改
@@ -3832,7 +3834,7 @@ int OnInit()
 
  ChartSetInteger(0,CHART_EVENT_MOUSE_MOVE,true);
  EventSetMillisecondTimer(MathMax(250,PanelRefreshMs));
- g_status="幽灵狙击手 v2.81 就绪｜过滤周期 "+EnumToString(FilterTF(PERIOD_M5))+"｜佣金自学习+动态滑点缓冲+保护修改重试";
+ g_status="幽灵狙击手 v2.82 就绪｜过滤周期 "+EnumToString(FilterTF(PERIOD_M5))+"｜佣金自学习+动态滑点缓冲+保护修改重试";
  Draw();return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason)
@@ -4020,6 +4022,9 @@ void RecalcAutoParams(bool force)
    g_wTrailDist =(int)MathRound(MathMax(a15*AutoWelfareDist,spr*2.0));
    g_wTrailStep =(int)MathRound(MathMax(a15*AutoWelfareStep,spr*0.5));
    g_maxSpread  =(int)MathRound(MathMax(spr*AutoSpreadMultiple,spr+10));
+   // 福利单是“奔跑单”：止盈放远，真正出场靠独立跟踪；止盈至少留出跟踪启动+两倍跟踪距离的空间
+   if(!g_welfareTPManual)
+      g_welfareTPPts=(int)MathRound(MathMax(a60*AutoWelfareTPH1,MathMax(g_wTrailStart+2.0*g_wTrailDist,tp*5.0)));
 
    string lotTxt="";
    if(AutoLotByRisk && mpp>0)
@@ -4035,8 +4040,9 @@ void RecalcAutoParams(bool force)
       lotTxt=StringFormat("｜手数 %.2f(风险%.1f%%=$%.0f)",g_lot,RiskPercentPerBatch,riskMoney)+lotTxt;
    }
 
-   g_autoInfo=StringFormat("自动[%s·%s] ATR5/15/60 %.0f/%.0f/%.0f 点差%.0f｜SL%d TP%d 距%d｜保本%d 追%d/%d%s",
-                           SymbolClassText(),sc?"抢钱":"狙击",a5,a15,a60,spr,sl,tp,gap,g_beTrig,g_trailTrig,g_trailDist,lotTxt);
+   g_autoInfo=StringFormat("自动[%s·%s] ATR5/15/60 %.0f/%.0f/%.0f 点差%.0f｜SL%d TP%d 距%d 福利TP%d%s｜保本%d 追%d/%d%s",
+                           SymbolClassText(),sc?"抢钱":"狙击",a5,a15,a60,spr,sl,tp,gap,g_welfareTPPts,g_welfareTPManual?"(手动)":"",
+                           g_beTrig,g_trailTrig,g_trailDist,lotTxt);
 }
 
 void OnTimer()
