@@ -4,8 +4,8 @@
 //| 每根新K线重算一次（只用已收盘K线，不重绘），全部用图形对象绘制。       |
 //+------------------------------------------------------------------+
 #property copyright "Jammy"
-#property version   "1.30"
-#property description "Jammy ICT Suite v1.30：SMT / 结构(BOS·CHoCH) / FVG / OB / 流动性 / 折价溢价·OTE / Killzone / CRT"
+#property version   "1.40"
+#property description "Jammy ICT Suite v1.40：SMT / 结构(BOS·CHoCH) / FVG / OB / 流动性 / 折价溢价·OTE / Killzone / CRT"
 #property indicator_chart_window
 #property indicator_buffers 0
 #property indicator_plots   0
@@ -26,6 +26,7 @@ input string SMTCandidates       = "XAGUSD,DXY,USDX,EURUSD,XPTUSD,US500"; // 当
 input int    CorrBars            = 120;   // 相关系数回看K线数（收益率相关）
 input double MinAbsCorr          = 0.50;  // |相关系数| 至少多少才判 SMT
 input bool   SMTGroupIgnoreCorr  = false; // 固定配对时不看相关系数门槛
+input bool   ShowLiveSMT         = true;  // 显示“形成中”的SMT（最新几根K线的高/低点，尚未被确认为波段点）
 input int    SMTMaxPairs         = 8;     // 检查最近多少个波段点（两品种合并后）
 input int    SMTSwingDepth       = 6;     // 每个新波段点往前最多对比几个旧波段（不限于相邻）
 input int    SMTOtherWindow      = 6;     // 对比品种取极值的时间窗口（±K线数）
@@ -693,7 +694,15 @@ void DetectSMT(string sym,double corr,int slot)
          if(m>0 && all[i]-piv[m-1]<gap) continue;
          ArrayResize(piv,m+1); piv[m]=all[i];
       }
+      // v1.40：最新几根K线的高/低点还没被确认成波段点（右侧需 SwingLen 根），
+      // 加一个“形成中”的点，实时比较最新这一段。
+      bool liveAdded=false;
       int cnt=ArraySize(piv);
+      if(ShowLiveSMT && N>2 && (cnt==0 || T[1]-piv[cnt-1]>=gap))
+      {
+         ArrayResize(piv,cnt+1); piv[cnt]=T[1]; cnt++;
+         liveAdded=true;
+      }
 
       for(int j=cnt-1;j>=MathMax(1,cnt-SMTMaxPairs);j--)
       {
@@ -713,14 +722,17 @@ void DetectSMT(string sym,double corr,int slot)
             bool otBreak=otherHigh?(oB>oA):(oB<oA);
             if(meBreak==otBreak) continue;        // 同时破或同时不破 = 没有背离
 
-            string id=sym+IntegerToString((long)mBt);
+            bool live=(liveAdded && j==cnt-1);
+            string id=sym+IntegerToString((long)mBt)+(live?"L":"");
             color c=highs?clrOrangeRed:clrSpringGreen;
             double off=slot*0.35*g_atr*(highs?1:-1);
-            Seg("SMT"+id,mAt,mA,mBt,mB,c,STYLE_SOLID,2);
+            Seg("SMT"+id,mAt,mA,mBt,mB,c,live?STYLE_DASH:STYLE_SOLID,live?1:2);
             string who=meBreak?(highs?"本品种创新高":"本品种创新低"):(highs?sym+"创新高":sym+"创新低");
-            Txt("SMTt"+id,mBt,mB+off,StringFormat("SMT%s vs %s（%s）",highs?"空":"多",sym,who),c,8,highs?ANCHOR_LEFT_LOWER:ANCHOR_LEFT_UPPER);
-            int barIdx=iBarShift(_Symbol,_Period,piv[j],false)-SwingLen;
-            if(AlertOnSMT) Notify("SMT"+id+(highs?"H":"L"),StringFormat("SMT%s背离（对比 %s，相关 %.2f，%s）",highs?"空":"多",sym,corr,who),barIdx);
+            Txt("SMTt"+id,mBt,mB+off,StringFormat("SMT%s vs %s（%s）%s",highs?"空":"多",sym,who,live?"·形成中":""),c,8,highs?ANCHOR_LEFT_LOWER:ANCHOR_LEFT_UPPER);
+            int barIdx=live?1:iBarShift(_Symbol,_Period,piv[j],false)-SwingLen;
+            // 形成中的SMT按“参考点”去重，同一组只提醒一次
+            string key=live?("SMTL"+sym+IntegerToString((long)mAt)+(highs?"H":"L")):("SMT"+id+(highs?"H":"L"));
+            if(AlertOnSMT) Notify(key,StringFormat("SMT%s背离%s（对比 %s，相关 %.2f，%s）",highs?"空":"多",live?"·形成中":"",sym,corr,who),barIdx);
             break;   // 每个新波段只标最近的一组
          }
       }
