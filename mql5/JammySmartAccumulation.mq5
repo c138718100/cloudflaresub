@@ -1,7 +1,7 @@
 #property copyright "Jammy / OpenAI - independent MT5 port"
-#property version   "1.690"
+#property version   "1.691"
 #property strict
-#property description "Jammy Smart Accumulation MT5 v1.69.0 Trading Core Lite + NumPad + RiskGuard"
+#property description "Jammy Smart Accumulation MT5 v1.69.1 Trading Core Lite + NumPad + RiskGuard"
 #property description "Trading core only: smart accumulation + manual market/pending manager. Heatmap/MTF dashboard moved to standalone indicator."
 
 // v1.67.3 UI变化：主面板底部信息区可折叠；状态文字拆成多行并始终留在面板背景内部。
@@ -161,7 +161,8 @@ input(name="收盘确认周期") ENUM_TIMEFRAMES HardStopConfirmTF = PERIOD_M15;
 
 input group "v1.69 24小时运行"
 input(name="24小时运行：吸筹挂单不过期、单笔失败不暂停、定时补齐奇数槽") bool SmartRun24h = true;
-input(name="奇数槽巡检间隔(分钟)") int SlotRepairMinutes = 5;
+input(name="偶数单止盈后也原位补单（同样无限循环）") bool EvenRecycleOnTP = true;
+input(name="空槽巡检间隔(分钟)") int SlotRepairMinutes = 5;
 
 input group "v1.68 新闻暂停（MT5经济日历）"
 input(name="高影响数据前后暂停自动补单/重排/循环") bool NewsPauseEnable = false;
@@ -2302,13 +2303,22 @@ bool PlaceSmartOrder(string comment,int slot,bool odd,double price,double lots)
    if(SmartTotalLots()+lots>MaxTotalLots+1e-9) { SetStatus("达到最大总手数"); return false; }
    double dist=SmartTpDistance(slot,odd,price,sl);
    double tp=NormalizePrice(g_direction==DIR_LONG?price+dist:price-dist);
+   bool fromPlan=false;
    for(int pi=0;pi<ArraySize(g_smart_plan);pi++)
    {
       if(g_smart_plan[pi].slot==slot && g_smart_plan[pi].tp_price>0)
       {
          tp=NormalizePrice(g_smart_plan[pi].tp_price);
+         fromPlan=true;
          break;
       }
+   }
+   // v1.69.1：偶数单补单沿用该槽原计划的止盈距离（分批TP），而不是固定RR兜底
+   string etpKey=StableGV("ETP"+IntegerToString(slot));
+   if(!odd && !fromPlan && GlobalVariableCheck(etpKey))
+   {
+      double d=GlobalVariableGet(etpKey);
+      if(d>PointValue()) tp=NormalizePrice(g_direction==DIR_LONG?price+d:price-d);
    }
 
    datetime expiration=0; // 由EA按K线数自行过期
@@ -2344,6 +2354,8 @@ bool PlaceSmartOrder(string comment,int slot,bool odd,double price,double lots)
 
    if(!ok)
       Print("JSA v1.67.1 槽位",slot,"下单失败｜",LastTradeResultText(comment));
+   else if(!odd && tp>0)
+      GlobalVariableSet(etpKey,MathAbs(tp-price));
    return ok;
 }
 
@@ -2476,15 +2488,19 @@ bool SmartSlotPositionOccupied(int slot,bool odd)
    return false;
 }
 
-void RearmOddSlot(string old_comment)
+void RearmOddSlot(string old_comment) { RearmSmartSlot(old_comment,true); }
+
+// v1.69.1：奇数/偶数单原位补单（奇数受“奇数单框内无限做T”控制，偶数受“偶数单止盈后也补单”控制）
+void RearmSmartSlot(string old_comment,bool odd)
 {
    if(g_recovery_pending) return; // v1.65 重载后禁止自动吸筹补挂
-   if(NewsBlocked("奇数补单")) return;
+   if(NewsBlocked(odd?"奇数补单":"偶数补单")) return;
 
    if(!g_smart_user_confirmed) return;
-   if(!g_running || g_paused || !InfiniteOddRecycle || !BoxExists()) return;
+   if(!g_running || g_paused || !BoxExists()) return;
+   if(odd ? !InfiniteOddRecycle : !EvenRecycleOnTP) return;
    int slot=ExtractSlot(old_comment);
-   if(slot<1 || SmartSlotOccupied(slot,true)) return;
+   if(slot<1 || (slot%2==1)!=odd || SmartSlotOccupied(slot,odd)) return;
    // v1.67.6：按本轮计划实际网格补回原槽位；自适应网格的间距≠固定间距。
    double gp=g_smart_gap_price; int maxSlot=g_smart_slot_max;
    if(gp<=0 || maxSlot<=0) { int count; double gpts; GridLayout(count,gp,gpts); maxSlot=count; }
@@ -2493,19 +2509,19 @@ void RearmOddSlot(string old_comment)
    target=NormalizePrice(target);
    if(!EntryInsideRiskBoundary(target)) return;
    int no_stop=0; double used=CurrentSymbolRiskPool(no_stop);
-   if(no_stop>0) { SetStatus("奇数循环暂停：本EA存在无止损风险"); return; }
+   if(no_stop>0) { SetStatus("吸筹循环暂停：本EA存在无止损风险"); return; }
    double rem=MathMax(0.0,EffectiveRiskBudgetUsd()-used);
    int mns=0; double manualRisk=ManualRiskNow(mns);
-   if(mns>0) { SetStatus("奇数循环暂停：手工系统存在无SL订单"); return; }
+   if(mns>0) { SetStatus("吸筹循环暂停：手工系统存在无SL订单"); return; }
    if(EnableCombinedRiskCap) rem=MathMin(rem,MathMax(0.0,CombinedRiskCapUsd()-used-manualRisk));
    ENUM_ORDER_TYPE dir=(g_direction==DIR_LONG?ORDER_TYPE_BUY:ORDER_TYPE_SELL);
    double maxlots=LotsForRisk(dir,target,StopPrice(),rem);
    double lots=g_smart_equal_lots>0?MathMin(g_smart_equal_lots,maxlots):maxlots;
    lots=NormalizeLotsDown(lots);
-   if(lots<=0) { SetStatus("奇数循环暂停：剩余风险不足"); return; }
-   string c=StringFormat("%s%d",ODD_PREFIX,slot);
-   if(PlaceSmartOrder(c,slot,true,target,lots))
-      SetStatus(StringFormat("框内吸金循环：第%d槽原位补回 @ %.*f｜框不后退、不整体重排",slot,DigitsValue(),target));
+   if(lots<=0) { SetStatus("吸筹循环暂停：剩余风险不足"); return; }
+   string c=StringFormat("%s%d",odd?ODD_PREFIX:EVEN_PREFIX,slot);
+   if(PlaceSmartOrder(c,slot,odd,target,lots))
+      SetStatus(StringFormat("框内吸金循环：%s第%d槽原位补回 @ %.*f｜框不后退、不整体重排",odd?"奇数":"偶数",slot,DigitsValue(),target));
 }
 
 // v1.68：高影响数据公布前后窗口（MT5经济日历，30秒缓存）
@@ -4885,7 +4901,7 @@ void BuildMainPanel()
 
    // 先给足背景高度，最后再按实际内容精确收口，避免构建过程中出现文字短暂跑出背景。
    RectLabel(UI_PREFIX+"BG",x,y,w,780,C'11,16,22');
-   Label(UI_PREFIX+"TITLE","Jammy 吞金兽 MT5 v1.69｜24H Auction + NumPad",x+8,y+6,clrDeepSkyBlue,FontSize+1);
+   Label(UI_PREFIX+"TITLE","Jammy 吞金兽 MT5 v1.69.1｜24H Auction + NumPad",x+8,y+6,clrDeepSkyBlue,FontSize+1);
    int yy=y+28; int bw=(w-5*g)/4;
    Button(UI_PREFIX+"LOCK","一键锁仓 [/]",x+g,yy,bw,bh,clrMaroon); Button(UI_PREFIX+"CLOSEALL","一键清仓 [*]",x+2*g+bw,yy,bw,bh,clrRed); Button(UI_PREFIX+"TRAIL","一键追踪",x+3*g+2*bw,yy,bw,bh,clrSteelBlue); Button(UI_PREFIX+"SMARTCALC","智能吸金/计算",x+4*g+3*bw,yy,bw,bh,clrPurple);
    yy+=bh+g;
@@ -5567,17 +5583,21 @@ void CleanupOrphanSmartStop()
    ChartRedraw();
 }
 
-// v1.69：定时巡检——运行中的吸筹任务，奇数槽既没有持仓也没有挂单时原位补回（同样受风险预算约束）
+// v1.69：定时巡检——运行中的吸筹任务，槽位既没有持仓也没有挂单时原位补回（同样受风险预算约束）
 void RepairOddSlots()
 {
    if(!SmartRun24h || !g_smart_user_confirmed || !g_running || g_paused || g_recovery_pending) return;
-   if(!InfiniteOddRecycle || !BoxExists() || g_smart_slot_max<=0) return;
+   if(!BoxExists() || g_smart_slot_max<=0) return;
    datetime now=TimeCurrent();
    if(g_lastSlotRepair>0 && now-g_lastSlotRepair<MathMax(1,SlotRepairMinutes)*60) return;
    g_lastSlotRepair=now;
-   for(int slot=1;slot<=g_smart_slot_max;slot+=2)
-      if(!SmartSlotOccupied(slot,true))
-         RearmOddSlot(StringFormat("%s%d",ODD_PREFIX,slot));
+   for(int slot=1;slot<=g_smart_slot_max;slot++)
+   {
+      bool odd=(slot%2==1);
+      if(odd ? !InfiniteOddRecycle : !EvenRecycleOnTP) continue;
+      if(!SmartSlotOccupied(slot,odd))
+         RearmSmartSlot(StringFormat("%s%d",odd?ODD_PREFIX:EVEN_PREFIX,slot),odd);
+   }
 }
 
 void OnTimer()
@@ -5622,6 +5642,9 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,const MqlTradeRequest &
    // 人工平仓、EA主动平仓、SL、Close By 等不再把订单“复活”。
    if(recycleAllowed && profitableOrTp && IsOddComment(c) && g_running && !g_paused && InfiniteOddRecycle)
       RearmOddSlot(c);
+   // v1.69.1：偶数单止盈后同样原位补回
+   if(recycleAllowed && profitableOrTp && IsEvenComment(c) && g_running && !g_paused && EvenRecycleOnTP)
+      RearmSmartSlot(c,false);
 
    if(recycleAllowed && profitableOrTp && c==StringFormat("%s1",MANUAL_SPLIT_PREFIX) && ManualSmartTracking && g_manual_tracking_active)
    {
