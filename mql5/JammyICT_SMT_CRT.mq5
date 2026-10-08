@@ -4,8 +4,8 @@
 //| 每根新K线重算一次（只用已收盘K线，不重绘），全部用图形对象绘制。       |
 //+------------------------------------------------------------------+
 #property copyright "Jammy"
-#property version   "1.00"
-#property description "Jammy ICT Suite v1.00：SMT / 结构(BOS·CHoCH) / FVG / OB / 流动性 / 折价溢价·OTE / Killzone / CRT"
+#property version   "1.10"
+#property description "Jammy ICT Suite v1.10：SMT / 结构(BOS·CHoCH) / FVG / OB / 流动性 / 折价溢价·OTE / Killzone / CRT"
 #property indicator_chart_window
 #property indicator_buffers 0
 #property indicator_plots   0
@@ -20,9 +20,12 @@ input int    ATRPeriod           = 14;
 
 input group "=== SMT 相关性背离 ==="
 input bool   ShowSMT             = true;
-input string SMTCandidates       = "XAGUSD,DXY,USDX,EURUSD,XPTUSD,US500"; // 候选品种（自动匹配经纪商后缀）
+// 固定配对组：组之间用 ; 分隔，组内品种用 , 分隔，同一品种的不同叫法用 | 分隔
+input string SMTGroups           = "EURUSD,GBPUSD;XAUUSD,XAGUSD;XTIUSD|USOIL|WTI,XBRUSD|XRBUSD|UKOIL|BRENT;USTEC|NAS100|US100|NDX,US500|SPX500|SP500,US30|DJ30|DOW";
+input string SMTCandidates       = "XAGUSD,DXY,USDX,EURUSD,XPTUSD,US500"; // 当前品种不在配对组时，自动从这里选相关性最高的
 input int    CorrBars            = 120;   // 相关系数回看K线数（收益率相关）
-input double MinAbsCorr          = 0.60;  // |相关系数| 至少多少才判 SMT
+input double MinAbsCorr          = 0.50;  // |相关系数| 至少多少才判 SMT
+input bool   SMTGroupIgnoreCorr  = false; // 固定配对时不看相关系数门槛
 input int    SMTMaxPairs         = 6;     // 最多回看多少组相邻波段
 
 input group "=== 市场结构 ==="
@@ -531,7 +534,7 @@ string FindBrokerSymbol(string base)
    for(int i=0;i<n;i++)
    {
       string s=SymbolName(i,false);
-      if(StringFind(s,base)==0 && StringLen(s)<=StringLen(base)+4) { SymbolSelect(s,true); return s; }
+      if(StringFind(s,base)==0 && StringLen(s)<=StringLen(base)+6) { SymbolSelect(s,true); return s; }
    }
    return "";
 }
@@ -557,20 +560,57 @@ double Correlation(string sym,int bars)
    return sab/MathSqrt(saa*sbb);
 }
 
-void PickSMTSymbol()
+// 当前图表品种是否属于某个成员（成员可有多个别名，按前缀匹配经纪商后缀）
+bool ChartIsMember(string member)
 {
-   g_smtSym=""; g_smtCorr=0; g_corrTable="";
+   string al[]; int n=StringSplit(member,'|',al);
+   for(int i=0;i<n;i++)
+   {
+      string a=al[i]; StringTrimLeft(a); StringTrimRight(a);
+      if(a!="" && StringFind(_Symbol,a)==0) return true;
+   }
+   return false;
+}
+
+string ResolveMember(string member)
+{
+   string al[]; int n=StringSplit(member,'|',al);
+   for(int i=0;i<n;i++)
+   {
+      string a=al[i]; StringTrimLeft(a); StringTrimRight(a);
+      if(a=="") continue;
+      string s=FindBrokerSymbol(a);
+      if(s!="" && s!=_Symbol) return s;
+   }
+   return "";
+}
+
+// 返回 true = 来自固定配对组
+bool BuildPartners(string &out[])
+{
+   ArrayResize(out,0);
+   string groups[]; int ng=StringSplit(SMTGroups,';',groups);
+   for(int g=0;g<ng;g++)
+   {
+      string mem[]; int nm=StringSplit(groups[g],',',mem);
+      int me=-1;
+      for(int m=0;m<nm;m++) if(ChartIsMember(mem[m])) { me=m; break; }
+      if(me<0) continue;
+      for(int m=0;m<nm;m++)
+      {
+         if(m==me) continue;
+         string s=ResolveMember(mem[m]);
+         if(s!="") { int k=ArraySize(out); ArrayResize(out,k+1); out[k]=s; }
+      }
+      return true;
+   }
    string parts[]; int n=StringSplit(SMTCandidates,',',parts);
    for(int i=0;i<n;i++)
    {
-      string base=parts[i]; StringTrimLeft(base); StringTrimRight(base);
-      if(base=="") continue;
-      string s=FindBrokerSymbol(base);
-      if(s=="" || s==_Symbol) continue;
-      double r=Correlation(s,CorrBars);
-      g_corrTable+=StringFormat("%s %+.2f  ",s,r);
-      if(MathAbs(r)>MathAbs(g_smtCorr)) { g_smtCorr=r; g_smtSym=s; }
+      string s=ResolveMember(parts[i]);
+      if(s!="") { int k=ArraySize(out); ArrayResize(out,k+1); out[k]=s; }
    }
+   return false;
 }
 
 // 对方品种在某个时间附近（±SwingLen根）的最高/最低
@@ -585,13 +625,10 @@ bool OtherExtreme(string sym,datetime t,bool wantHigh,double &v)
    return v>0;
 }
 
-void SMT()
+// 对一个对比品种检测波段背离；slot 用于多个品种时错开文字
+void DetectSMT(string sym,double corr,int slot)
 {
-   if(!ShowSMT) return;
-   PickSMTSymbol();
-   if(g_smtSym=="" || MathAbs(g_smtCorr)<MinAbsCorr) return;
-   bool inverse=(g_smtCorr<0);   // 负相关（如美元指数）：我方高点对应对方低点
-
+   bool inverse=(corr<0);   // 负相关：我方高点对应对方低点
    for(int pass=0;pass<2;pass++)
    {
       bool highs=(pass==0);
@@ -603,24 +640,46 @@ void SMT()
          SWING a=g_sw[idx[p-1]], b=g_sw[idx[p]];
          bool otherHigh=(highs!=inverse);
          double oa,ob;
-         if(!OtherExtreme(g_smtSym,a.time,otherHigh,oa) || !OtherExtreme(g_smtSym,b.time,otherHigh,ob)) continue;
+         if(!OtherExtreme(sym,a.time,otherHigh,oa) || !OtherExtreme(sym,b.time,otherHigh,ob)) continue;
 
-         // 把对方换算成"与我方同向"的比较：负相关时对方方向取反
          bool meHigher=(b.price>a.price), meLower=(b.price<a.price);
          bool otHigher=inverse?(ob<oa):(ob>oa), otLower=inverse?(ob>oa):(ob<oa);
-
-         bool smt=false;
-         if(highs) smt=(meHigher && !otHigher) || (otHigher && !meHigher);   // 一方创新高、另一方没有
-         else      smt=(meLower && !otLower)   || (otLower && !meLower);     // 一方创新低、另一方没有
+         bool smt=highs ? ((meHigher && !otHigher) || (otHigher && !meHigher))    // 一方创新高、另一方没有
+                        : ((meLower && !otLower)   || (otLower && !meLower));    // 一方创新低、另一方没有
          if(!smt) continue;
 
-         string id=IntegerToString((long)b.time);
+         string id=sym+IntegerToString((long)b.time);
          color c=highs?clrOrangeRed:clrSpringGreen;
+         double off=slot*0.35*g_atr*(highs?1:-1);
          Seg("SMT"+id,a.time,a.price,b.time,b.price,c,STYLE_SOLID,2);
-         Txt("SMTt"+id,b.time,b.price,StringFormat("SMT%s vs %s",highs?"空":"多",g_smtSym),c,8,highs?ANCHOR_LEFT_LOWER:ANCHOR_LEFT_UPPER);
-         if(AlertOnSMT) Notify("SMT"+id+(highs?"H":"L"),StringFormat("SMT%s背离（对比 %s，相关 %.2f）",highs?"空":"多",g_smtSym,g_smtCorr),b.idx-SwingLen);
+         Txt("SMTt"+id,b.time,b.price+off,StringFormat("SMT%s vs %s",highs?"空":"多",sym),c,8,highs?ANCHOR_LEFT_LOWER:ANCHOR_LEFT_UPPER);
+         if(AlertOnSMT) Notify("SMT"+id+(highs?"H":"L"),StringFormat("SMT%s背离（对比 %s，相关 %.2f）",highs?"空":"多",sym,corr),b.idx-SwingLen);
       }
    }
+}
+
+void SMT()
+{
+   g_smtSym=""; g_smtCorr=0; g_corrTable="";
+   if(!ShowSMT) return;
+   string partners[];
+   bool fromGroup=BuildPartners(partners);
+   double corr[]; ArrayResize(corr,ArraySize(partners));
+   for(int i=0;i<ArraySize(partners);i++)
+   {
+      corr[i]=Correlation(partners[i],CorrBars);
+      g_corrTable+=StringFormat("%s %+.2f  ",partners[i],corr[i]);
+      if(MathAbs(corr[i])>MathAbs(g_smtCorr)) { g_smtCorr=corr[i]; g_smtSym=partners[i]; }
+   }
+   if(fromGroup)
+   {
+      // 固定配对：每个配对品种分别检测（如 USTEC 同时对比 US500 与 US30）
+      int slot=0;
+      for(int i=0;i<ArraySize(partners);i++)
+         if(SMTGroupIgnoreCorr || MathAbs(corr[i])>=MinAbsCorr) DetectSMT(partners[i],corr[i],slot++);
+   }
+   else if(g_smtSym!="" && MathAbs(g_smtCorr)>=MinAbsCorr)
+      DetectSMT(g_smtSym,g_smtCorr,0);
 }
 
 //+------------------------------------------------------------------+
@@ -629,8 +688,9 @@ void SMT()
 void Panel()
 {
    string trend=(g_trend>0?"多头结构":(g_trend<0?"空头结构":"未定"));
-   string smt=(g_smtSym==""?"无可用相关品种":StringFormat("%s 相关 %.2f%s",g_smtSym,g_smtCorr,
-               MathAbs(g_smtCorr)<MinAbsCorr?"（不足，未判SMT）":(g_smtCorr<0?"（负相关）":"")));
+   string smt=(g_smtSym==""?"无可用配对品种（检查市场报价里是否有对应品种）":
+               StringFormat("最高相关 %s %.2f%s",g_smtSym,g_smtCorr,
+               (MathAbs(g_smtCorr)<MinAbsCorr && !SMTGroupIgnoreCorr)?"（低于门槛，未判SMT）":(g_smtCorr<0?"（负相关）":"")));
    Comment(StringFormat("Jammy ICT Suite｜%s %s\n结构：%s｜最近：%s\nSMT：%s\n相关：%s\nCRT：%s",
            _Symbol,StringSubstr(EnumToString((ENUM_TIMEFRAMES)_Period),7),
            trend,g_lastEvent==""?"--":g_lastEvent,smt,g_corrTable,g_crtText==""?"--":g_crtText));
