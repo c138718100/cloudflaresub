@@ -173,26 +173,19 @@ input bool         EnableKeyboard       = true; // 启用键盘快捷键
 input bool         EnableNumPad         = true; // 启用小键盘数字快捷键
 input bool         EmergencyDoublePress = true; // 紧急全平需要二次确认
 input int          EmergencyWindowSec   = 2; // 二次确认有效时间(秒)
-input int          DeletePendingKey      = 110; // 删除挂单快捷键(小键盘小数点)
 
 
 input group "=== 快捷键(ASCII/虚拟键码) ==="
+// 字母主键可自定义；数字键固定按面板标注：
+// 7狙击多 8排单多 9平多 | 1狙击空 2排单空 3平空 | 4平浮盈 5均价推保 6平浮亏 | 0紧急全平 | .删除挂单
 input int          MarketBuyKey          = 66;  // 狙击买主键(B)
-input int          MarketBuyNumKey       = 103; // 狙击买副键(Num7)
 input int          LadderBuyKey          = 78;  // 排单买主键(N)
-input int          LadderBuyNumKey       = 104; // 排单买副键(Num8)
 input int          MarketSellKey         = 83;  // 狙击卖主键(S)
-input int          MarketSellNumKey      = 97;  // 狙击卖副键(Num1)
 input int          LadderSellKey         = 68;  // 排单卖主键(D)
-input int          LadderSellNumKey      = 98;  // 排单卖副键(Num2)
 input int          CloseProfitKey        = 80;  // 平浮盈主键(P)
-input int          CloseProfitNumKey     = 101; // 平浮盈副键(Num4)
 input int          BreakEvenKey          = 84;  // 推保本主键(T)
-input int          BreakEvenNumKey       = 102; // 推保本副键(Num5)
 input int          CloseBuyKey           = 77;  // 平多单主键(M)
-input int          CloseBuyNumKey        = 105; // 平多单副键(Num9)
 input int          CloseSellKey          = 70;  // 平空单主键(F)
-input int          CloseSellNumKey       = 99;  // 平空单副键(Num3)
 
 input group "=== 面板设置 ==="
 input int          PanelX               = 15; // 面板横向位置X
@@ -3318,11 +3311,11 @@ void Draw()
  Btn("BE",x+145,y+624+sy,125,26,"均价推保 [5]",C'40,85,150');
  Btn("LOSS",x+280,y+624+sy,125,26,"平浮亏 [6]",C'150,55,45');
 
- Btn("DEL",x+10,y+655+sy,125,26,"删除挂单",C'155,125,45');
+ Btn("DEL",x+10,y+655+sy,125,26,"删除挂单 [.]",C'155,125,45');
  Btn("PAUSE",x+145,y+655+sy,125,26,
-     g_pause?"▶ 恢复 [0]":"⏸ 暂停 [0]",
+     g_pause?"▶ 恢复":"⏸ 暂停",
      g_pause?C'30,130,70':C'80,85,100');
- Btn("ALL",x+280,y+655+sy,125,26,"紧急全平 [.]",C'180,35,35');
+ Btn("ALL",x+280,y+655+sy,125,26,"紧急全平 [0]",C'180,35,35');
 
  Btn("BTP",x+10,y+686+sy,190,26,
      "多TP→均价+"+IntegerToString(AverageTPOffsetPts),
@@ -3376,8 +3369,11 @@ void Draw()
  UpdateLatencyText();
  Txt("I5",x+20,y+935+sy,g_latencyText,7,g_latencyColor);
 
- Txt("KEY",x+10,y+970+sy,
-     "NumPad: 7狙击多/8排单多/9平多 | 1狙击空/2排单空/3平空 | O隐藏/显示 | .删除挂单",
+ Txt("KEY",x+10,y+966+sy,
+     "小键盘: 7狙击多 8排单多 9平多 | 1狙击空 2排单空 3平空 | 4平浮盈 5推保 6平浮亏",
+     7,C'170,180,190');
+ Txt("KEY2",x+10,y+984+sy,
+     "0紧急全平(按两次) | .删除挂单 | +/-手数 | O隐藏/显示",
      7,C'170,180,190');
 
  ChartRedraw();
@@ -3533,20 +3529,23 @@ void OnChartEvent(const int id,const long &lp,const double &dp,const string &sp)
    int k=(int)lp;
    if(EnablePanelToggleHotkey && k==PanelToggleKey){SetPanelHidden(!g_panelHidden);return;}
    if(!EnableKeyboard)return;
-   if(k==MarketBuyKey || k==55 || (EnableNumPad&&k==MarketBuyNumKey))Action("B7");
-   else if(k==LadderBuyKey || k==56 || (EnableNumPad&&k==LadderBuyNumKey))Action("B8");
-   else if(k==CloseBuyKey || k==57 || (EnableNumPad&&k==CloseBuyNumKey))Action("B9");
-   else if(k==MarketSellKey || k==49 || (EnableNumPad&&k==MarketSellNumKey))Action("S1");
-   else if(k==LadderSellKey || k==50 || (EnableNumPad&&k==LadderSellNumKey))Action("S2");
-   else if(k==CloseSellKey || k==51 || (EnableNumPad&&k==CloseSellNumKey))Action("S3");
-   else if(k==CloseProfitKey || k==52 || (EnableNumPad&&k==CloseProfitNumKey))Action("WIN");
-   else if(k==BreakEvenKey || k==53 || (EnableNumPad&&k==BreakEvenNumKey))Action("BE");
-   else if(k==54)Action("LOSS");
-   else if(k==48 || (EnableNumPad&&k==96))Action("PAUSE");
-   else if(k==46)Action("DEL");
-   else if(EnableNumPad && (k==DeletePendingKey || k==110))Action("DEL");
-   else if(EnableNumPad && k==107)Action("LP");
-   else if(EnableNumPad && k==109)Action("LM");
+   bool np=EnableNumPad;
+
+   // 小键盘虚拟键码：Num0=96 … Num9=105，Num.=110，Num+=107，Num-=109
+   // 主键盘数字：'0'=48 … '9'=57；Delete键=46（NumLock关闭时小键盘.也发46）
+   if     (k==MarketBuyKey   || k==55 || (np&&k==103)) Action("B7");    // 7 狙击多
+   else if(k==LadderBuyKey   || k==56 || (np&&k==104)) Action("B8");    // 8 排单多
+   else if(k==CloseBuyKey    || k==57 || (np&&k==105)) Action("B9");    // 9 平多单
+   else if(k==MarketSellKey  || k==49 || (np&&k==97))  Action("S1");    // 1 狙击空
+   else if(k==LadderSellKey  || k==50 || (np&&k==98))  Action("S2");    // 2 排单空
+   else if(k==CloseSellKey   || k==51 || (np&&k==99))  Action("S3");    // 3 平空单
+   else if(k==CloseProfitKey || k==52 || (np&&k==100)) Action("WIN");   // 4 平浮盈
+   else if(k==BreakEvenKey   || k==53 || (np&&k==101)) Action("BE");    // 5 均价推保
+   else if(                     k==54 || (np&&k==102)) Action("LOSS");  // 6 平浮亏
+   else if(                     k==48 || (np&&k==96))  Action("ALL");   // 0 紧急全平（二次确认）
+   else if(k==46 || (np&&k==110))                      Action("DEL");   // . 删除挂单
+   else if(np && k==107)                               Action("LP");    // + 手数
+   else if(np && k==109)                               Action("LM");    // - 手数
  }
 }
 int OnInit()
