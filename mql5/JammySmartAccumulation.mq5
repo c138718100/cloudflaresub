@@ -1,7 +1,7 @@
 #property copyright "Jammy / OpenAI - independent MT5 port"
-#property version   "1.676"
+#property version   "1.677"
 #property strict
-#property description "Jammy Smart Accumulation MT5 v1.67.6 Trading Core Lite + NumPad + RiskGuard"
+#property description "Jammy Smart Accumulation MT5 v1.67.7 Trading Core Lite + NumPad + RiskGuard"
 #property description "Trading core only: smart accumulation + manual market/pending manager. Heatmap/MTF dashboard moved to standalone indicator."
 
 // v1.67.3 UI变化：主面板底部信息区可折叠；状态文字拆成多行并始终留在面板背景内部。
@@ -4608,7 +4608,7 @@ void BuildMainPanel()
 
    // 先给足背景高度，最后再按实际内容精确收口，避免构建过程中出现文字短暂跑出背景。
    RectLabel(UI_PREFIX+"BG",x,y,w,780,C'11,16,22');
-   Label(UI_PREFIX+"TITLE","Jammy 吞金兽 MT5 v1.67.6｜AutoRisk + NumPad",x+8,y+6,clrDeepSkyBlue,FontSize+1);
+   Label(UI_PREFIX+"TITLE","Jammy 吞金兽 MT5 v1.67.7｜AutoRisk + NumPad",x+8,y+6,clrDeepSkyBlue,FontSize+1);
    int yy=y+28; int bw=(w-5*g)/4;
    Button(UI_PREFIX+"LOCK","一键锁仓 [/]",x+g,yy,bw,bh,clrMaroon); Button(UI_PREFIX+"CLOSEALL","一键清仓 [*]",x+2*g+bw,yy,bw,bh,clrRed); Button(UI_PREFIX+"TRAIL","一键追踪",x+3*g+2*bw,yy,bw,bh,clrSteelBlue); Button(UI_PREFIX+"SMARTCALC","智能吸金/计算",x+4*g+3*bw,yy,bw,bh,clrPurple);
    yy+=bh+g;
@@ -5172,6 +5172,7 @@ int OnInit()
    g_running=false;
    g_paused=false;
    if(BoxExists()) { g_direction_prepared=true; DrawSmartStop(); CacheBox(); }
+   else ObjectDelete(0,OBJ_SMART_STOP);   // 上次残留的孤立止损线
    ObjectDelete(0,RESTORE_UI_OBJ);
    BuildMainPanel(); // v1.67.4：热图/共振已拆分为独立指标，不在交易EA中加载
 
@@ -5222,8 +5223,39 @@ bool NeedDynamicRiskRefill()
    return false;
 }
 
+// v1.67.7：取消吸金计划。未确认运行时连同吸金框和止损线一起清除；
+// 已在运行的吸金只取消待确认计划，不再顺带把运行中的策略静默停掉。
+void CancelSmartPlanButton()
+{
+   g_smart_plan_ready=false;
+   ArrayResize(g_smart_plan,0);
+   if(g_smart_user_confirmed && g_running)
+   {
+      SetStatus("已取消待确认计划｜吸金仍在运行，如需结束请点“停止吸金”");
+      return;
+   }
+   g_smart_user_confirmed=false;
+   g_running=false;
+   ClearSmartTaskContext();   // 删除吸金框 + 止损线
+   SetStatus("已取消吸金计划：吸金框和止损线已清除，不会排单");
+}
+
+// 吸金框不在了（被手动删除等），止损线随之清除，避免留下删不掉的孤立虚线。
+void CleanupOrphanSmartStop()
+{
+   if(BoxExists() || ObjectFind(0,OBJ_SMART_STOP)<0) return;
+   ObjectDelete(0,OBJ_SMART_STOP);
+   if(g_smart_user_confirmed && g_running)
+   {
+      g_paused=true;
+      SetStatus("吸金框已被删除：吸金已暂停（持仓/挂单保持不动），请重新画框或点“停止吸金”");
+   }
+   ChartRedraw();
+}
+
 void OnTimer()
 {
+   CleanupOrphanSmartStop();
    // v1.67.4 Trading Core Lite：只刷新交易主面板。
    // 市场热图/多周期共振由独立指标负责，避免CopyRates/多品种刷新占用交易EA线程。
    if(!g_ui_hidden)
@@ -5485,7 +5517,7 @@ void OnChartEvent(const int id,const long &lparam,const double &dparam,const str
    else if(sparam==UI_PREFIX+"BOXBUY") CreateDirectionalBox(DIR_LONG);
    else if(sparam==UI_PREFIX+"BOXSELL") CreateDirectionalBox(DIR_SHORT);
    else if(sparam==UI_PREFIX+"START") ConfirmSmartPlan();
-   else if(sparam==UI_PREFIX+"CANCELPLAN") { g_smart_plan_ready=false; g_smart_user_confirmed=false; g_running=false; ArrayResize(g_smart_plan,0); SetStatus("已取消吸金待确认计划：不会排单"); }
+   else if(sparam==UI_PREFIX+"CANCELPLAN") CancelSmartPlanButton();
    else if(sparam==UI_PREFIX+"DRAWSL") DrawManualStop();
    else if(sparam==UI_PREFIX+"CANCELORD") CancelAllPending();
    else if(sparam==UI_PREFIX+"CLOSELOSS") CloseByProfit(false);
