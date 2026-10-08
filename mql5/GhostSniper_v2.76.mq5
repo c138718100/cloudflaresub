@@ -1,6 +1,6 @@
 #property strict
-#property version   "2.820"
-#property description "幽灵狙击手 - MT5黄金半自动交易与趋势过滤面板 v2.82 自动参数版"
+#property version   "2.830"
+#property description "幽灵狙击手 - MT5黄金半自动交易与趋势过滤面板 v2.83 自动参数版"
 
 #include <Trade/Trade.mqh>
 CTrade trade;
@@ -304,7 +304,8 @@ int g_beTrig=100,g_bePlus=30,g_trailTrig=300,g_trailDist=200,g_trailStep=50;
 int g_wTrailStart=600,g_wTrailDist=350,g_wTrailStep=100,g_maxSpread=120;
 bool g_autoParams=true;
 bool g_autoReady=false;
-bool g_welfareTPManual=false;   // 面板手动改过福利TP → 自动不再覆盖，直到重新开启自动参数
+bool g_welfareTPManual=false;
+bool g_lotManual=false;        // 手动改过手数 → 按风险自动手数不再覆盖，直到重新开启自动参数   // 面板手动改过福利TP → 自动不再覆盖，直到重新开启自动参数
 datetime g_autoLastBar=0;
 string g_autoInfo="自动参数：等待数据";
 int hAtrM5=INVALID_HANDLE,hAtrM15=INVALID_HANDLE,hAtrH1=INVALID_HANDLE;
@@ -3131,6 +3132,14 @@ void ApplyEdit(string key,string text)
  else if(key=="GPV"){g_gapPts=MathMax(1,v);g_status="排单间距已改为 "+IntegerToString(g_gapPts)+" 点";}
  else if(key=="CNTV"){g_orderCount=MathMax(1,MathMin(10,v));g_status="每次单数已改为 "+IntegerToString(g_orderCount);}
  else if(key=="WTV"){g_welfareTPPts=MathMax(1,v);g_welfareTPManual=true;g_status="福利单TP已改为 "+IntegerToString(g_welfareTPPts)+" 点"+(g_autoParams?"（福利TP改为手动，其它仍自动）":"");}
+ else if(key=="LOTV")
+ {
+    double want=d;
+    g_lot=NLot(want);
+    g_lotManual=true;
+    g_status="手数已改为 "+DoubleToString(g_lot,2)+
+             (want>MaxPanelLot+1e-9?StringFormat("（超过面板最大手数 %.2f，已限制；可在参数 MaxPanelLot 调大）",MaxPanelLot):"");
+ }
  else if(key=="MTV"){g_maxTotalOrders=MathMax(1,v);g_status="总单数上限已改为 "+IntegerToString(g_maxTotalOrders)+" 单";}
  else if(key=="MSV")
  {
@@ -3303,14 +3312,15 @@ void Draw()
  int panelH=1055+statShift;
 
  Rect("BG",x,y,w,panelH,C'20,22,27');
- Txt("TITLE",x+10,y+7,"幽灵狙击手  MT5 v2.82 AUTO ADAPT",11,C'255,210,40');
+ Txt("TITLE",x+10,y+7,"幽灵狙击手  MT5 v2.83 AUTO ADAPT",11,C'255,210,40');
  Btn("HIDE",x+345,y+5,60,20,"隐藏 O",C'55,65,80');
  Txt("MODE",x+10,y+26,"Ghost Sniper · 黄金半自动交易/趋势过滤系统",8,C'210,210,210');
 
  Btn("SHORT",x+10,y+41,190,22,"★ 抢钱模式",g_shortMode?C'190,125,0':C'80,80,85');
  Btn("LONG",x+210,y+41,195,22,"狙击模式",!g_shortMode?C'40,115,75':C'80,80,85');
 
- Txt("LOT",x+10,y+69,"手数  "+DoubleToString(g_lot,2),9);
+ Txt("LOT",x+10,y+69,"手数",9);
+ EditBox("LOTV",x+50,y+65,68,22,DoubleToString(g_lot,2));   // v2.83：手数可直接输入
  Btn("LM",x+125,y+65,45,22,"-手",C'80,80,90');
  Btn("LP",x+175,y+65,45,22,"+手",C'80,80,90');
  Btn("AUTO",x+230,y+65,175,22,g_autoParams?"自动参数 ● 开":"自动参数 ○ 关(手动)",g_autoParams?C'0,110,120':C'85,85,85');
@@ -3640,7 +3650,7 @@ void Action(string a)
  else if(a=="AUTO")
  {
    g_autoParams=!g_autoParams;
-   if(g_autoParams){ g_welfareTPManual=false; RecalcAutoParams(true); g_status="自动参数已开启：按本品种ATR与点差实时计算（含福利TP）"; }
+   if(g_autoParams){ g_welfareTPManual=false; g_lotManual=false; RecalcAutoParams(true); g_status="自动参数已开启：按本品种ATR与点差实时计算（含福利TP）"; }
    else
    {
       // 关闭自动：保护参数回到输入值，止损/止盈/间距保持当前数值，可在面板手动改
@@ -3683,8 +3693,8 @@ void Action(string a)
  else if(a=="LOSS"){CloseByProfit(false);lightOnly=true;}
  else if(a=="DEL"){DeletePending();lightOnly=true;}
  else if(a=="PAUSE"){g_pause=!g_pause;g_status=g_pause?"快捷交易已暂停":"快捷交易已恢复";}
- else if(a=="LM"){g_lot=NLot(g_lot-LotStepButton);g_status="手数 "+DoubleToString(g_lot,2);}
- else if(a=="LP"){g_lot=NLot(g_lot+LotStepButton);g_status="手数 "+DoubleToString(g_lot,2);}
+ else if(a=="LM"){g_lot=NLot(g_lot-LotStepButton);g_lotManual=true;g_status="手数 "+DoubleToString(g_lot,2);}
+ else if(a=="LP"){g_lot=NLot(g_lot+LotStepButton);g_lotManual=true;g_status="手数 "+DoubleToString(g_lot,2);}
  else if(a=="ALL")
  {
    if(!EmergencyDoublePress)CloseAll();
@@ -3760,7 +3770,7 @@ void OnChartEvent(const int id,const long &lp,const double &dp,const string &sp)
    if(StringFind(sp,PX)==0)
    {
       string key=StringSubstr(sp,StringLen(PX));
-      if(key=="SLV"||key=="TPV"||key=="OFV"||key=="GPV"||key=="CNTV"||key=="WTV"||key=="WLV"||key=="MTV"||key=="MSV")
+      if(key=="SLV"||key=="TPV"||key=="OFV"||key=="GPV"||key=="CNTV"||key=="WTV"||key=="WLV"||key=="MTV"||key=="MSV"||key=="LOTV")
       {
          ApplyEdit(key,ObjectGetString(0,sp,OBJPROP_TEXT));return;
       }
@@ -3769,7 +3779,7 @@ void OnChartEvent(const int id,const long &lp,const double &dp,const string &sp)
  if(id==CHARTEVENT_OBJECT_CLICK)
  {
    string a=sp;if(StringFind(a,PX)==0)a=StringSubstr(a,StringLen(PX));
-   if(a=="SLV"||a=="TPV"||a=="OFV"||a=="GPV"||a=="CNTV"||a=="WTV"||a=="WLV"||a=="MTV"||a=="MSV"){g_editFocus=true;return;}
+   if(a=="SLV"||a=="TPV"||a=="OFV"||a=="GPV"||a=="CNTV"||a=="WTV"||a=="WLV"||a=="MTV"||a=="MSV"||a=="LOTV"){g_editFocus=true;return;}
    g_editFocus=false;
 
    // 先弹起按钮再执行交易，避免同步下单期间按钮看起来“卡死”。
@@ -3834,7 +3844,7 @@ int OnInit()
 
  ChartSetInteger(0,CHART_EVENT_MOUSE_MOVE,true);
  EventSetMillisecondTimer(MathMax(250,PanelRefreshMs));
- g_status="幽灵狙击手 v2.82 就绪｜过滤周期 "+EnumToString(FilterTF(PERIOD_M5))+"｜佣金自学习+动态滑点缓冲+保护修改重试";
+ g_status="幽灵狙击手 v2.83 就绪｜过滤周期 "+EnumToString(FilterTF(PERIOD_M5))+"｜佣金自学习+动态滑点缓冲+保护修改重试";
  Draw();return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason)
@@ -4027,7 +4037,7 @@ void RecalcAutoParams(bool force)
       g_welfareTPPts=(int)MathRound(MathMax(a60*AutoWelfareTPH1,MathMax(g_wTrailStart+2.0*g_wTrailDist,tp*5.0)));
 
    string lotTxt="";
-   if(AutoLotByRisk && mpp>0)
+   if(AutoLotByRisk && mpp>0 && !g_lotManual)
    {
       double riskMoney=AccountInfoDouble(ACCOUNT_EQUITY)*MathMax(0.0,RiskPercentPerBatch)/100.0;
       double perOrder=riskMoney/MathMax(1,g_orderCount);
