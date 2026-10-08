@@ -1,6 +1,6 @@
 #property strict
-#property version   "2.770"
-#property description "幽灵狙击手 - MT5黄金半自动交易与趋势过滤面板 v2.77 执行保护增强版"
+#property version   "2.780"
+#property description "幽灵狙击手 - MT5黄金半自动交易与趋势过滤面板 v2.78 执行保护增强版"
 
 #include <Trade/Trade.mqh>
 CTrade trade;
@@ -218,6 +218,10 @@ string g_unifiedFollowName="";
 double g_lot=0.01;
 bool g_pause=false;
 ulong g_lastEmergencyMs=0; // v2.77：用真实毫秒计时，无报价时也不会误判二次确认
+// v2.78：外接/蓝牙小键盘防误触。
+#define GS_KF_REPEAT 0x4000      // CHARTEVENT_KEYDOWN sparam：按住不放产生的自动重复
+#define GS_MIN_DOUBLE_PRESS_MS 250 // 二次确认两次按键至少间隔，过滤“00/000”键连发
+bool g_editFocus=false;          // 正在面板输入框打字时屏蔽快捷键
 string g_status="就绪";
 bool g_shortMode=true;
 bool g_manualTakeover=false;
@@ -3178,7 +3182,7 @@ void Draw()
  int panelH=1015+statShift;
 
  Rect("BG",x,y,w,panelH,C'20,22,27');
- Txt("TITLE",x+10,y+7,"幽灵狙击手  MT5 v2.77 EXEC GUARD",11,C'255,210,40');
+ Txt("TITLE",x+10,y+7,"幽灵狙击手  MT5 v2.78 EXEC GUARD",11,C'255,210,40');
  Btn("HIDE",x+345,y+5,60,20,"隐藏 O",C'55,65,80');
  Txt("MODE",x+10,y+26,"Ghost Sniper · 黄金半自动交易/趋势过滤系统",8,C'210,210,210');
 
@@ -3537,6 +3541,11 @@ void Action(string a)
  {
    if(!EmergencyDoublePress)CloseAll();
    else if(g_lastEmergencyMs>0 &&
+           GetTickCount64()-g_lastEmergencyMs<GS_MIN_DOUBLE_PRESS_MS)
+   {
+      // 间隔太短（“00”键连发/手抖），不算第二次确认，保留第一次的等待状态。
+   }
+   else if(g_lastEmergencyMs>0 &&
            GetTickCount64()-g_lastEmergencyMs<=(ulong)MathMax(1,EmergencyWindowSec)*1000)
    {
       g_lastEmergencyMs=0;
@@ -3598,6 +3607,7 @@ void OnChartEvent(const int id,const long &lp,const double &dp,const string &sp)
 
  if(id==CHARTEVENT_OBJECT_ENDEDIT)
  {
+   g_editFocus=false;
    if(StringFind(sp,PX)==0)
    {
       string key=StringSubstr(sp,StringLen(PX));
@@ -3610,7 +3620,8 @@ void OnChartEvent(const int id,const long &lp,const double &dp,const string &sp)
  if(id==CHARTEVENT_OBJECT_CLICK)
  {
    string a=sp;if(StringFind(a,PX)==0)a=StringSubstr(a,StringLen(PX));
-   if(a=="SLV"||a=="TPV"||a=="OFV"||a=="GPV"||a=="CNTV"||a=="WTV"||a=="WLV")return;
+   if(a=="SLV"||a=="TPV"||a=="OFV"||a=="GPV"||a=="CNTV"||a=="WTV"||a=="WLV"){g_editFocus=true;return;}
+   g_editFocus=false;
 
    // 先弹起按钮再执行交易，避免同步下单期间按钮看起来“卡死”。
    if(ObjectFind(0,sp)>=0)ObjectSetInteger(0,sp,OBJPROP_STATE,false);
@@ -3622,6 +3633,9 @@ void OnChartEvent(const int id,const long &lp,const double &dp,const string &sp)
  if(id==CHARTEVENT_KEYDOWN)
  {
    int k=(int)lp;
+   // 按住不放的自动重复一律忽略：防止按住7连续开单、按住0被当成二次确认全平。
+   if(((int)StringToInteger(sp) & GS_KF_REPEAT)!=0)return;
+   if(g_editFocus)return;
    if(EnablePanelToggleHotkey && k==PanelToggleKey){SetPanelHidden(!g_panelHidden);return;}
    if(!EnableKeyboard)return;
    bool np=EnableNumPad;
@@ -3666,7 +3680,7 @@ int OnInit()
 
  ChartSetInteger(0,CHART_EVENT_MOUSE_MOVE,true);
  EventSetMillisecondTimer(MathMax(250,PanelRefreshMs));
- g_status="幽灵狙击手 v2.77 就绪｜过滤周期 "+EnumToString(FilterTF(PERIOD_M5))+"｜佣金自学习+动态滑点缓冲+保护修改重试";
+ g_status="幽灵狙击手 v2.78 就绪｜过滤周期 "+EnumToString(FilterTF(PERIOD_M5))+"｜佣金自学习+动态滑点缓冲+保护修改重试";
  Draw();return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason)
