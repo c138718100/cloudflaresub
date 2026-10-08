@@ -1,7 +1,7 @@
 #property copyright "Jammy / OpenAI - independent MT5 port"
-#property version   "1.677"
+#property version   "1.680"
 #property strict
-#property description "Jammy Smart Accumulation MT5 v1.67.7 Trading Core Lite + NumPad + RiskGuard"
+#property description "Jammy Smart Accumulation MT5 v1.68.0 Trading Core Lite + NumPad + RiskGuard"
 #property description "Trading core only: smart accumulation + manual market/pending manager. Heatmap/MTF dashboard moved to standalone indicator."
 
 // v1.67.3 UI变化：主面板底部信息区可折叠；状态文字拆成多行并始终留在面板背景内部。
@@ -147,6 +147,24 @@ input(name="仅TP成交后允许循环回挂") bool RecycleOnlyOnTakeProfit = tr
 input(name="部分排单失败时撤销本轮新排单") bool RollbackPartialPendingPlan = true;
 input(name="每手往返佣金USD（计入止损风险，0=不计）") double CommissionPerLotRT = 7.0;
 input(name="当日最大亏损USD（已实现+浮动，达到后禁止新开仓，0=关闭）") double DailyMaxLossUsd = 0.0;
+
+// =========================
+// v1.68 拍卖理论增强（全部可关，关掉=v1.67行为）
+// =========================
+input group "v1.68 波动自适应 / 止损缓冲"
+input(name="黄金等所有品种也按ATR计算网格间距/小止盈") bool AtrAdaptiveAllSymbols = true;
+input(name="小止盈=1小时ATR的比例（非高价品种）") double OddTpAtrPct = 0.12;
+input(name="小止盈至少=单次交易成本(点差+佣金)的倍数") double OddTpMinCostMultiple = 3.0;
+input(name="止损放在框外的缓冲（1小时ATR倍数，0=贴框边）") double SmartStopBufferATR = 0.15;
+input(name="硬止损需收盘确认跌破/升破框边（关=碰框边即清仓）") bool HardStopCloseConfirm = true;
+input(name="收盘确认周期") ENUM_TIMEFRAMES HardStopConfirmTF = PERIOD_M15;
+
+input group "v1.68 新闻暂停（MT5经济日历）"
+input(name="高影响数据前后暂停自动补单/重排/循环") bool NewsPauseEnable = true;
+input(name="新闻货币") string NewsCurrency = "USD";
+input(name="公布前暂停分钟") int NewsPauseBeforeMin = 15;
+input(name="公布后暂停分钟") int NewsPauseAfterMin = 15;
+input(name="新闻前撤销未成交吸筹挂单（结束后自动重挂）") bool NewsCancelPending = false;
 
 // =========================
 // 管理范围
@@ -381,6 +399,11 @@ double g_plan_gap_price=0.0;
 int g_plan_slot_max=0;
 double g_smart_gap_price=0.0;
 int g_smart_slot_max=0;
+
+// v1.68：止损缓冲（价格单位）。计算吸金计划时冻结，运行期间不随ATR变化，避免SL反复被改。
+double g_stop_buffer=0.0;
+double g_h1atr=0.0; datetime g_h1atr_bar=0;
+datetime g_news_check=0; bool g_news_active=false; string g_news_name=""; bool g_news_cancelled=false;
 
 // v1.67.6：运行中拖框防误触，记录上一次合法的框位置。
 datetime g_box_t0=0,g_box_t1=0;
@@ -1249,10 +1272,29 @@ bool IsHighPriceInstrument()
    return MidPrice()>ORIGINAL_HIGH_PRICE_THRESHOLD;
 }
 
+double CachedH1ATR()
+{
+   datetime b=iTime(_Symbol,PERIOD_H1,0);
+   if(b!=g_h1atr_bar || g_h1atr<=0) { g_h1atr=CalcATR(_Symbol,PERIOD_H1,14,1); g_h1atr_bar=b; }
+   return g_h1atr;
+}
+
+// 单次往返交易成本（点）：当前点差 + 往返佣金
+double TradeCostPoints()
+{
+   double pt=PointValue(); if(pt<=0) return 0.0;
+   double spread=(CurrentAsk()-CurrentBid())/pt;
+   double mpp=MoneyPerPrice(1.0)*pt;
+   double comm=(mpp>0 && CommissionPerLotRT>0) ? CommissionPerLotRT/mpp : 0.0;
+   return MathMax(0.0,spread)+comm;
+}
+
+bool UseAtrAdaptive() { return IsHighPriceInstrument() || AtrAdaptiveAllSymbols; }
+
 double GetGridGapPoints()
 {
-   if(!IsHighPriceInstrument()) return (double)FixedGridGapPoints;
-   double h1=CalcATR(_Symbol,PERIOD_H1,14,1);
+   if(!UseAtrAdaptive()) return (double)FixedGridGapPoints;
+   double h1=CachedH1ATR();
    double d1=CalcATR(_Symbol,PERIOD_D1,14,1);
    if(h1<=0) return FixedGridGapPoints;
    double adaptive=h1*H1AtrGridPct/PointValue();
@@ -1262,10 +1304,15 @@ double GetGridGapPoints()
 
 double GetOddTpPoints()
 {
-   if(!IsHighPriceInstrument()) return (double)OddTpPoints;
-   double h1=CalcATR(_Symbol,PERIOD_H1,14,1);
+   if(!UseAtrAdaptive()) return (double)OddTpPoints;
+   double h1=CachedH1ATR();
    if(h1<=0) return OddTpPoints;
-   return MathMax(1.0,h1*H1AtrOddTpPct/PointValue());
+   double pct=IsHighPriceInstrument() ? H1AtrOddTpPct : OddTpAtrPct;
+   double tp=h1*pct/PointValue();
+   // v1.68：小止盈至少覆盖若干倍交易成本，避免做T利润被点差+佣金吃掉
+   if(!IsHighPriceInstrument() && OddTpMinCostMultiple>0)
+      tp=MathMax(tp,TradeCostPoints()*OddTpMinCostMultiple);
+   return MathMax(1.0,tp);
 }
 
 double EffectiveTpRR(double base_rr,int rank=1)
@@ -1410,9 +1457,24 @@ double BoxWidth()
    return MathMax(PointValue(),BoxHigh()-BoxLow());
 }
 
+double LiveStopBuffer()
+{
+   if(SmartStopBufferATR<=0) return 0.0;
+   double a=CachedH1ATR();
+   return a>0 ? a*SmartStopBufferATR : 0.0;
+}
+
+double StopBuffer() { return g_stop_buffer>0 ? g_stop_buffer : LiveStopBuffer(); }
+
+// 框边（价值区边界）
+double BoxEdgeStop() { return g_direction==DIR_LONG?BoxLow():BoxHigh(); }
+
+// v1.68：实际止损 = 框边再往外放一段缓冲，给“扫止损”留空间；手数按此距离计算，总风险不变
 double StopPrice()
 {
-   return g_direction==DIR_LONG?BoxLow():BoxHigh();
+   double b=StopBuffer();
+   if(b<=0) return BoxEdgeStop();
+   return NormalizePrice(g_direction==DIR_LONG ? BoxLow()-b : BoxHigh()+b);
 }
 
 void DrawSmartStop()
@@ -1432,6 +1494,7 @@ void CreateDirectionalBox(JsaDirection dir)
 {
    g_direction=dir;
    g_direction_prepared=true;
+   g_stop_buffer=0.0;   // 新框：止损缓冲在计算计划时重新冻结
    datetime t2=iTime(_Symbol,_Period,0);
    int bars=Bars(_Symbol,_Period);
    int shift=MathMin(MathMax(1,BoxBarsLeft),MathMax(1,bars-1));
@@ -1884,6 +1947,7 @@ void PrepareSmartPlan()
    g_risk_usd=MathMax(1.0,g_risk_usd);
    string reason;
    if(!ValidateBox(reason)) { SetStatus(reason); return; }
+   g_stop_buffer=LiveStopBuffer();   // v1.68：冻结本轮止损缓冲
 
    // v1.61：旧吸筹挂单撤销后，已经成交的吸筹仓位允许进入下一轮新框。
    // 对旧成交仓不再按“旧SL”占用风险，而是先按“新框止损边界”重新核算。
@@ -2315,6 +2379,7 @@ void ConfirmSmartPlan()
    g_smart_confirm_box_low=BoxLow(); g_smart_confirm_box_high=BoxHigh();
    g_smart_trend_extreme=(g_direction==DIR_LONG ? CurrentAsk() : CurrentBid());
    SetSmartGrid(g_plan_gap_price,g_plan_slot_max);
+   GlobalVariableSet(StableGV("SBF"),g_stop_buffer);
    CacheBox();
 
    BeginSmartTask();
@@ -2383,6 +2448,7 @@ bool SmartSlotPositionOccupied(int slot,bool odd)
 void RearmOddSlot(string old_comment)
 {
    if(g_recovery_pending) return; // v1.65 重载后禁止自动吸筹补挂
+   if(NewsBlocked("奇数补单")) return;
 
    if(!g_smart_user_confirmed) return;
    if(!g_running || g_paused || !InfiniteOddRecycle || !BoxExists()) return;
@@ -2409,6 +2475,56 @@ void RearmOddSlot(string old_comment)
    string c=StringFormat("%s%d",ODD_PREFIX,slot);
    if(PlaceSmartOrder(c,slot,true,target,lots))
       SetStatus(StringFormat("框内吸金循环：第%d槽原位补回 @ %.*f｜框不后退、不整体重排",slot,DigitsValue(),target));
+}
+
+// v1.68：高影响数据公布前后窗口（MT5经济日历，30秒缓存）
+bool NewsWindowActive()
+{
+   if(!NewsPauseEnable) return false;
+   datetime now=TimeTradeServer(); if(now<=0) now=TimeCurrent();
+   if(g_news_check>0 && now-g_news_check<30) return g_news_active;
+   g_news_check=now; g_news_active=false; g_news_name="";
+   MqlCalendarValue v[];
+   int n=CalendarValueHistory(v,now-MathMax(0,NewsPauseAfterMin)*60,now+MathMax(0,NewsPauseBeforeMin)*60,NULL,NewsCurrency);
+   for(int i=0;i<n;i++)
+   {
+      MqlCalendarEvent ev;
+      if(!CalendarEventById(v[i].event_id,ev) || ev.importance!=CALENDAR_IMPORTANCE_HIGH) continue;
+      g_news_active=true;
+      g_news_name=ev.name+" "+TimeToString(v[i].time,TIME_MINUTES);
+      break;
+   }
+   return g_news_active;
+}
+
+bool NewsBlocked(string action)
+{
+   if(!NewsWindowActive()) return false;
+   string msg=action+"暂停：高影响数据 "+g_news_name+" 前后";
+   if(g_status!=msg) SetStatus(msg);
+   return true;
+}
+
+// 每秒调用：新闻前可选撤销吸筹挂单；新闻窗口结束后按当前框补齐/重挂
+// （窗口内被暂停的奇数补单、过期补单都在这里一次性补回）
+bool g_news_was_active=false;
+void NewsGuardTick()
+{
+   if(!NewsPauseEnable) return;
+   bool active=NewsWindowActive();
+   bool running=(g_smart_user_confirmed && g_running && !g_paused);
+   if(active && running && NewsCancelPending && !g_news_cancelled)
+   {
+      CancelSmartPending();
+      g_news_cancelled=true;
+      SetStatus("新闻前已撤销未成交吸筹挂单："+g_news_name+"｜结束后自动重挂");
+   }
+   if(!active && g_news_was_active)
+   {
+      g_news_cancelled=false;
+      if(running) RebuildPendingGrid(true);
+   }
+   g_news_was_active=active;
 }
 
 void SetSmartGrid(double gap_price,int slot_max)
@@ -2469,6 +2585,11 @@ void RebuildPendingGrid(bool force=false)
    if(!force && g_last_regrid_time>0 && TimeCurrent()-g_last_regrid_time<1) return;
    if(!force && g_last_regrid_center!=0 && MathAbs(center-g_last_regrid_center)<threshold) return;
 
+   if(NewsBlocked("动态推进"))
+   {
+      g_last_regrid_center=center; g_last_regrid_time=TimeCurrent();
+      return;   // 旧排单保持不动
+   }
    if(!NewRiskAllowed("动态推进"))
    {
       g_last_regrid_center=center; g_last_regrid_time=TimeCurrent();
@@ -2753,7 +2874,17 @@ void TightenSmartStops()
 bool HitHardStop()
 {
    if(!BoxExists()) return false;
-   return g_direction==DIR_LONG ? CurrentBid()<=StopPrice() : CurrentAsk()>=StopPrice();
+   // 实际止损（含缓冲）被触及：经纪商SL也会成交，这里清理剩余仓位与挂单
+   if(g_direction==DIR_LONG ? CurrentBid()<=StopPrice() : CurrentAsk()>=StopPrice()) return true;
+
+   if(!HardStopCloseConfirm)
+      return g_direction==DIR_LONG ? CurrentBid()<=BoxLow() : CurrentAsk()>=BoxHigh();
+
+   // v1.68：收盘确认——已收盘K线收在框外 = 价格在价值区外被接受，结束本轮吸筹；
+   // 只是影线扫过框边（扫止损）不触发。
+   double c=iClose(_Symbol,HardStopConfirmTF,1);
+   if(c<=0) return false;
+   return g_direction==DIR_LONG ? c<BoxLow() : c>BoxHigh();
 }
 
 // v1.57：彻底结束“吸金框任务”。
@@ -2778,6 +2909,7 @@ void ClearSmartTaskContext()
    ArrayResize(g_smart_plan,0);
 
    SetSmartGrid(0.0,0);
+   g_stop_buffer=0.0; GlobalVariableSet(StableGV("SBF"),0.0);
    ObjectDelete(0,OBJ_BOX);
    ObjectDelete(0,OBJ_SMART_STOP);
    ChartRedraw();
@@ -3143,6 +3275,7 @@ void LoadStabilityState()
    if(GlobalVariableCheck(StableGV("TM")))  g_snap_time=(datetime)GlobalVariableGet(StableGV("TM"));
    if(GlobalVariableCheck(StableGV("GAP"))) g_smart_gap_price=GlobalVariableGet(StableGV("GAP"));
    if(GlobalVariableCheck(StableGV("SMX"))) g_smart_slot_max=(int)GlobalVariableGet(StableGV("SMX"));
+   if(GlobalVariableCheck(StableGV("SBF"))) g_stop_buffer=GlobalVariableGet(StableGV("SBF"));
 }
 
 void SaveRiskSnapshot(double budget,double existing_risk,double new_risk,double total_lots,double stop)
@@ -3583,6 +3716,7 @@ void RearmManualTracking()
    // 独立于吸金框：停止框内吸金不会关闭这里。
    if(!ManualSmartTracking || !g_manual_tracking_active) return;
    if(!NewRiskAllowed("手工循环回挂")) return;
+   if(NewsBlocked("手工循环回挂")) return;
    // 市价首批循环必须由“一键追踪”明确开启；吸筹系统完全不参与。
    if(g_manual_tracking_source_mode==1 && (!MarketCycleTracking || !g_one_key_trailing)) return;
    if(g_manual_tracking_source_mode==2 && !PendingCycleTracking) return;
@@ -4608,7 +4742,7 @@ void BuildMainPanel()
 
    // 先给足背景高度，最后再按实际内容精确收口，避免构建过程中出现文字短暂跑出背景。
    RectLabel(UI_PREFIX+"BG",x,y,w,780,C'11,16,22');
-   Label(UI_PREFIX+"TITLE","Jammy 吞金兽 MT5 v1.67.7｜AutoRisk + NumPad",x+8,y+6,clrDeepSkyBlue,FontSize+1);
+   Label(UI_PREFIX+"TITLE","Jammy 吞金兽 MT5 v1.68｜Auction + NumPad",x+8,y+6,clrDeepSkyBlue,FontSize+1);
    int yy=y+28; int bw=(w-5*g)/4;
    Button(UI_PREFIX+"LOCK","一键锁仓 [/]",x+g,yy,bw,bh,clrMaroon); Button(UI_PREFIX+"CLOSEALL","一键清仓 [*]",x+2*g+bw,yy,bw,bh,clrRed); Button(UI_PREFIX+"TRAIL","一键追踪",x+3*g+2*bw,yy,bw,bh,clrSteelBlue); Button(UI_PREFIX+"SMARTCALC","智能吸金/计算",x+4*g+3*bw,yy,bw,bh,clrPurple);
    yy+=bh+g;
@@ -5256,6 +5390,7 @@ void CleanupOrphanSmartStop()
 void OnTimer()
 {
    CleanupOrphanSmartStop();
+   NewsGuardTick();
    // v1.67.4 Trading Core Lite：只刷新交易主面板。
    // 市场热图/多周期共振由独立指标负责，避免CopyRates/多品种刷新占用交易EA线程。
    if(!g_ui_hidden)
