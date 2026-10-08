@@ -1,6 +1,6 @@
-#property strict
+﻿#property strict
 #property version   "2.850"
-#property description "幽灵狙击手 - MT5黄金半自动交易与趋势过滤面板 v2.85 自动盈亏比版"
+#property description "幽灵狙击手 - MT5黄金半自动交易与趋势过滤面板 v2.86 面板记忆+日亏损上限版"
 
 #include <Trade/Trade.mqh>
 CTrade trade;
@@ -174,6 +174,8 @@ input bool   EnableAutoParams      = true;  // 启动时开启自动参数（面
 input bool   AutoRRMode            = false; // 启动时是否开启盈亏比模式（面板“盈亏比”按钮可随时开关）：止盈 = 止损 × 盈亏比
 input double AutoRRMin             = 1.5;   // 第1单的盈亏比（止盈/止损），面板可改
 input double AutoRRMax             = 2.0;   // 最后一单的盈亏比（排单止盈开启时各单在 Min~Max 之间递增），面板可改
+input double DailyMaxLossUSD       = 0.0;   // v2.86 当日最大亏损（今日已平仓+当前浮亏，USD，0=关闭）：达到后禁止开新单，次日自动解除；面板可改
+input bool   RememberPanelValues   = true;  // v2.86 记住面板上改过的数值（切换周期/重启MT5后恢复；参数栏改动后以参数栏为准）
 input double ProtectStartUSD       = 0.0;   // 普通单组合净盈利达到多少美元才开启自动保护（推保本/追踪），0=按点数触发；面板可改
 input double AutoSLScalpATR        = 1.2;   // 盈亏比模式·抢钱：止损 = M5 ATR × 此倍数
 input double AutoSLSniperATR       = 1.2;   // 盈亏比模式·狙击：止损 = M15 ATR × 此倍数
@@ -317,7 +319,7 @@ bool g_autoReady=false;
 bool g_welfareTPManual=false;
 bool g_lotManual=false;
 bool g_rrMode=false; double g_rrMin=1.5,g_rrMax=2.0;   // v2.85：盈亏比运行时设置（面板可改）
-double g_protectUSD=0.0;                                // v2.85：盈利达到多少美元开启自动保护（0=按点数）        // 手动改过手数 → 按风险自动手数不再覆盖，直到重新开启自动参数   // 面板手动改过福利TP → 自动不再覆盖，直到重新开启自动参数
+double g_protectUSD=0.0; double g_dailyMaxLoss=0.0; ulong g_resetPressMs=0;                                // v2.85：盈利达到多少美元开启自动保护（0=按点数）        // 手动改过手数 → 按风险自动手数不再覆盖，直到重新开启自动参数   // 面板手动改过福利TP → 自动不再覆盖，直到重新开启自动参数
 datetime g_autoLastBar=0;
 string g_autoInfo="自动参数：等待数据";
 int hAtrM5=INVALID_HANDLE,hAtrM15=INVALID_HANDLE,hAtrH1=INVALID_HANDLE;
@@ -1036,9 +1038,21 @@ bool DirectionAllowed(ENUM_ORDER_TYPE type)
    return true;
 }
 
+// v2.86：今日已平仓盈亏（实时） + 本EA当前品种所有持仓浮动盈亏
+double OpenFloatPL()
+{
+   int n1,n2;double l1,p1,a1,l2,p2,a2;
+   Stats(POSITION_TYPE_BUY,n1,l1,p1,a1);
+   Stats(POSITION_TYPE_SELL,n2,l2,p2,a2);
+   return p1+p2;
+}
+double TodayTotalPL(){ return TodayRealizedPL()+OpenFloatPL(); }
+bool DailyLossHit(){ return (g_dailyMaxLoss>0 && TodayTotalPL()<=-g_dailyMaxLoss); }
+
 bool TradeOK()
 {
    if(g_pause){g_status="快捷交易已暂停";return false;}
+   if(DailyLossHit()){g_status=StringFormat("⛔ 今日亏损已达上限 $%.0f，禁止开新单（已有单子照常管理，次日自动解除）",g_dailyMaxLoss);return false;}
    MqlTick t;if(!SymbolInfoTick(_Symbol,t))return false;
    if((t.ask-t.bid)/_Point>g_maxSpread){g_status="点差过大，拒绝下单";return false;}
    return true;
@@ -2479,14 +2493,35 @@ double GroupNetMoney(double lots,double netPts){ return netPts*MoneyPerPointPerL
 // 盈亏比模式下手动参数：止盈跟随止损×最小RR
 void SyncTPWithRR(){ if(g_rrMode && g_slPts>0) g_tpPts=(int)MathMax(1,MathRound(g_slPts*MathMax(0.1,g_rrMin))); }
 
-int ProtectGroupAtAverage(ENUM_POSITION_TYPE ty,int &skipped)
+// v2.86：盈利≥$X 换算成需要的净盈利点数（有持仓按较大一边的普通单手数，无持仓按 手数×单数 估算）
+double ProtectNeedPts()
+{
+   if(g_protectUSD<=0) return 0.0;
+   double mpp=MoneyPerPointPerLot(); if(mpp<=0) return 0.0;
+   double lots=0;
+   for(int side=0;side<2;side++)
+   {
+      int c=0;double l=0,a=0,cp=0,cu=0,np=0;
+      if(GroupProtectionData(side==0?POSITION_TYPE_BUY:POSITION_TYPE_SELL,c,l,a,cp,cu,np)) lots=MathMax(lots,l);
+   }
+   if(lots<=0) lots=NLot(g_lot)*MathMax(1,g_orderCount);
+   return (lots>0 ? g_protectUSD/(mpp*lots) : 0.0);
+}
+// 当前止盈点数（盈亏比模式取第1单）
+int CurrentTPPts(){ return RRModeActive() ? (int)MathRound(g_slPts*LayerRR(0)) : StepTPBase(); }
+
+int ProtectGroupAtAverage(ENUM_POSITION_TYPE ty,int &skipped,bool manual=false)
 {
    skipped=0;
    int count=0;double lots=0,avg=0,costPts=0,cur=0,netPts=0;
    if(!GroupProtectionData(ty,count,lots,avg,costPts,cur,netPts))return 0;
    // v2.85：设了“盈利达到$X开启保护”时，按组合净盈利金额触发；否则按点数触发
-   if(g_protectUSD>0){ if(GroupNetMoney(lots,netPts)<g_protectUSD){skipped=count;return 0;} }
-   else if(netPts<g_beTrig){skipped=count;return 0;}
+   // v2.86：手动推保（小键盘5/按钮）不受自动门槛限制，只要价格离成本线够远即可
+   if(!manual)
+   {
+      if(g_protectUSD>0){ if(GroupNetMoney(lots,netPts)<g_protectUSD){skipped=count;return 0;} }
+      else if(netPts<g_beTrig){skipped=count;return 0;}
+   }
 
    long stops=(long)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL);
    long freeze=(long)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_FREEZE_LEVEL);
@@ -2516,10 +2551,11 @@ int ProtectGroupAtAverage(ENUM_POSITION_TYPE ty,int &skipped)
 void BreakEvenAll()
 {
    int skipB=0,skipS=0;
-   int okB=ProtectGroupAtAverage(POSITION_TYPE_BUY,skipB);
-   int okS=ProtectGroupAtAverage(POSITION_TYPE_SELL,skipS);
+   int okB=ProtectGroupAtAverage(POSITION_TYPE_BUY,skipB,true);
+   int okS=ProtectGroupAtAverage(POSITION_TYPE_SELL,skipS,true);
    g_status="均价成本保护：成功 "+IntegerToString(okB+okS)+" 单；跳过 "+
-            IntegerToString(skipB+skipS)+" 单｜只改SL，不主动平仓";
+            IntegerToString(skipB+skipS)+" 单｜只改SL，不主动平仓"+
+            ((okB+okS)==0?"（手动推保不看门槛；跳过=价格离成本线太近或已推过）":"");
 }
 
 void AutoProtect()
@@ -3191,7 +3227,14 @@ void ApplyEdit(string key,string text)
  else if(key=="PROTV")
  {
     g_protectUSD=MathMax(0.0,d);
-    g_status=(g_protectUSD>0?StringFormat("普通单组合净盈利达到 $%.0f 时开启自动保护",g_protectUSD):"自动保护改为按点数触发");
+    g_status=(g_protectUSD>0?StringFormat("普通单组合净盈利达到 $%.0f 时开启自动保护（约需 %.0f 点）",g_protectUSD,ProtectNeedPts()):"自动保护改为按点数触发");
+    if(g_protectUSD>0 && ProtectNeedPts()>CurrentTPPts())
+       g_status+=StringFormat("｜⚠ 超过首单止盈 %d 点，打到止盈前不会推保",CurrentTPPts());
+ }
+ else if(key=="DLV")
+ {
+    g_dailyMaxLoss=MathMax(0.0,d);
+    g_status=(g_dailyMaxLoss>0?StringFormat("当日最大亏损已设为 $%.0f（今日已平仓+浮亏达到后禁止开新单）",g_dailyMaxLoss):"当日最大亏损：关闭");
  }
  else if(key=="MTV"){g_maxTotalOrders=MathMax(1,v);g_status="总单数上限已改为 "+IntegerToString(g_maxTotalOrders)+" 单";}
  else if(key=="MSV")
@@ -3205,6 +3248,7 @@ void ApplyEdit(string key,string text)
     g_status=(g_welfareLayer==0?"福利单层级：自动中间层":"福利单层级：第"+IntegerToString(g_welfareLayer)+"层");
  }
  if(autoTurnedOff) g_status+="（自动参数已关闭，改为手动）";
+ SavePanelState();
  Draw();
 }
 double CurrentATRValue()
@@ -3365,7 +3409,8 @@ void Draw()
  int panelH=1055+statShift;
 
  Rect("BG",x,y,w,panelH,C'20,22,27');
- Txt("TITLE",x+10,y+7,"幽灵狙击手  MT5 v2.85 AUTO RR",11,C'255,210,40');
+ Txt("TITLE",x+10,y+7,"幽灵狙击手  MT5 v2.86",11,C'255,210,40');
+ Btn("RESET",x+282,y+5,58,20,(g_resetPressMs>0&&GetTickCount64()-g_resetPressMs<=3000)?"再点确认":"恢复默认",C'90,60,60');
  Btn("HIDE",x+345,y+5,60,20,"隐藏 O",C'55,65,80');
  Txt("MODE",x+10,y+26,"Ghost Sniper · 黄金半自动交易/趋势过滤系统",8,C'210,210,210');
 
@@ -3390,7 +3435,12 @@ void Draw()
  Txt("PROT",x+10,y+165,"快速参数（双击→输入→Enter）",8,C'110,230,130');
  Txt("PUT",x+205,y+165,"盈利≥$",8,C'110,230,130');
  EditBox("PROTV",x+252,y+161,60,20,(g_protectUSD>0?DoubleToString(g_protectUSD,0):"按点数"));
- Txt("PUT2",x+318,y+165,"开启保护",8,C'110,230,130');
+ {
+    double need=ProtectNeedPts();
+    bool over=(need>0 && need>CurrentTPPts());
+    Txt("PUT2",x+318,y+165,(g_protectUSD>0?StringFormat("≈%.0f点%s",need,over?" ⚠":""):"开启保护"),8,
+        over?C'255,150,70':C'110,230,130');
+ }
  Txt("SLT",x+10,y+184,"止损",8);
  EditBox("SLV",x+58,y+180,105,21,IntegerToString(g_slPts));
 
@@ -3646,6 +3696,10 @@ void Draw()
      "今日盈利 "+todaySign+DoubleToString(todayPL,2)+" USD"+
      (todayPL>0?"  ● 盈利":(todayPL<0?"  ● 亏损":"  ● 持平")),
      8,todayColor);
+ // v2.86：当日最大亏损（面板可改）
+ bool dlHit=(g_dailyMaxLoss>0 && todayPL+OpenFloatPL()<=-g_dailyMaxLoss);
+ Txt("DLT",x+250,y+895+sy,dlHit?"⛔日亏上限$":"日亏上限$",8,dlHit?C'255,80,80':C'230,200,80');
+ EditBox("DLV",x+330,y+891+sy,70,19,(g_dailyMaxLoss>0?DoubleToString(g_dailyMaxLoss,0):"关闭"));
 
  Txt("I3",x+20,y+915+sy,"状态："+g_status,8,C'200,210,220');
 
@@ -3705,6 +3759,18 @@ void Action(string a)
  }
  else if(a=="SHORT"){g_shortMode=true;g_tpPts=ShortTPPoints;g_gapPts=ShortLadderGap;g_offsetPts=ShortLadderOffset;g_status="已切换抢钱模式并载入抢钱参数";}
  else if(a=="LONG"){g_shortMode=false;g_tpPts=LongTPPoints;g_gapPts=LongLadderGap;g_offsetPts=LongLadderOffset;g_status="已切换狙击模式并载入狙击参数";}
+ else if(a=="RESET")
+ {
+   ulong nowMs=GetTickCount64();
+   if(g_resetPressMs>0 && nowMs-g_resetPressMs>=GS_MIN_DOUBLE_PRESS_MS && nowMs-g_resetPressMs<=3000)
+   {
+      g_resetPressMs=0;
+      ApplyInputDefaults();
+      RecalcAutoParams(true);
+      g_status="面板数值已恢复为参数栏的设置";
+   }
+   else { g_resetPressMs=nowMs; g_status="3秒内再点一次“恢复默认”，面板所有数值恢复为参数栏设置"; }
+ }
  else if(a=="RRB")
  {
    g_rrMode=!g_rrMode;
@@ -3783,6 +3849,7 @@ void Action(string a)
  }
 
  if((a=="SHORT"||a=="LONG") && g_autoParams){ RecalcAutoParams(true); g_status+="（自动参数已按新模式重算）"; }
+ if(!lightOnly || a=="LM" || a=="LP") SavePanelState();
  if(lightOnly)FastStatusUpdate();
  else Draw();
 }
@@ -3835,7 +3902,7 @@ void OnChartEvent(const int id,const long &lp,const double &dp,const string &sp)
    if(StringFind(sp,PX)==0)
    {
       string key=StringSubstr(sp,StringLen(PX));
-      if(key=="SLV"||key=="TPV"||key=="OFV"||key=="GPV"||key=="CNTV"||key=="WTV"||key=="WLV"||key=="MTV"||key=="MSV"||key=="LOTV"||key=="RRMIN"||key=="RRMAX"||key=="PROTV")
+      if(key=="SLV"||key=="TPV"||key=="OFV"||key=="GPV"||key=="CNTV"||key=="WTV"||key=="WLV"||key=="MTV"||key=="MSV"||key=="LOTV"||key=="RRMIN"||key=="RRMAX"||key=="PROTV"||key=="DLV")
       {
          ApplyEdit(key,ObjectGetString(0,sp,OBJPROP_TEXT));return;
       }
@@ -3844,7 +3911,7 @@ void OnChartEvent(const int id,const long &lp,const double &dp,const string &sp)
  if(id==CHARTEVENT_OBJECT_CLICK)
  {
    string a=sp;if(StringFind(a,PX)==0)a=StringSubstr(a,StringLen(PX));
-   if(a=="SLV"||a=="TPV"||a=="OFV"||a=="GPV"||a=="CNTV"||a=="WTV"||a=="WLV"||a=="MTV"||a=="MSV"||a=="LOTV"||a=="RRMIN"||a=="RRMAX"||a=="PROTV"){g_editFocus=true;return;}
+   if(a=="SLV"||a=="TPV"||a=="OFV"||a=="GPV"||a=="CNTV"||a=="WTV"||a=="WLV"||a=="MTV"||a=="MSV"||a=="LOTV"||a=="RRMIN"||a=="RRMAX"||a=="PROTV"||a=="DLV"){g_editFocus=true;return;}
    g_editFocus=false;
 
    // 先弹起按钮再执行交易，避免同步下单期间按钮看起来“卡死”。
@@ -3882,7 +3949,10 @@ void OnChartEvent(const int id,const long &lp,const double &dp,const string &sp)
    else if(np && k==109)                               Action("LM");    // - 手数
  }
 }
-int OnInit()
+//---------------- v2.86 面板数值记忆 ----------------
+string g_restoredNote="";
+// 参数栏的值 → 运行时变量
+void ApplyInputDefaults()
 {
  g_lot=NLot(DefaultLot);g_shortMode=StartShortMode;g_trendFilter=StartTrendFilter;g_floatMonitor=EnableFloatMonitor;
  g_slPts=FixedSLPoints;
@@ -3893,10 +3963,66 @@ int OnInit()
  g_maxTotalOrders=MathMax(1,MaxTotalOrders);g_maxSideLots=MathMax(0.0,MaxSideLots);
  g_beTrig=BreakEvenTriggerPts;g_bePlus=BreakEvenPlusPts;g_trailTrig=TrailTriggerPts;g_trailDist=TrailDistancePts;g_trailStep=TrailStepPts;
  g_wTrailStart=WelfareTrailStartPts;g_wTrailDist=WelfareTrailDistancePts;g_wTrailStep=WelfareTrailStepPts;g_maxSpread=MaxSpreadPoints;
- g_autoParams=EnableAutoParams;g_autoReady=false;g_sprN=0;g_sprPos=0;
- g_rrMode=AutoRRMode;g_rrMin=MathMax(0.1,AutoRRMin);g_rrMax=MathMax(g_rrMin,AutoRRMax);g_protectUSD=MathMax(0.0,ProtectStartUSD);SyncTPWithRR();
+ g_autoParams=EnableAutoParams;g_autoReady=false;g_welfareTPManual=false;g_lotManual=false;
+ g_rrMode=AutoRRMode;g_rrMin=MathMax(0.1,AutoRRMin);g_rrMax=MathMax(g_rrMin,AutoRRMax);g_protectUSD=MathMax(0.0,ProtectStartUSD);g_dailyMaxLoss=MathMax(0.0,DailyMaxLossUSD);
+ g_welfareEnabled=EnableWelfareOrder;g_steppedTP=EnableSteppedTP;g_floatTriggerPct=FloatProfitPct;
+ SyncTPWithRR();
+}
+string PanelKey(string k){ return "GS_"+_Symbol+"_"+IntegerToString(MagicNumber)+"_"+k; }
+// 参数栏相关输入的指纹：参数栏改过 → 以参数栏为准，不恢复旧的面板数值
+double InputsHash()
+{
+   string t=StringFormat("%.4f|%d|%d|%d|%.4f|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%.4f|%d|%d|%.4f|%.4f|%.4f|%.4f|%d|%d|%.4f",
+      DefaultLot,(int)StartShortMode,(int)StartTrendFilter,(int)EnableFloatMonitor,FloatProfitPct,FixedSLPoints,
+      ShortTPPoints,LongTPPoints,FixedTPPoints,ShortLadderGap,LongLadderGap,LadderGapPoints,ShortLadderOffset,LongLadderOffset,
+      LadderOffsetPoints,LadderOrders,MaxTotalOrders,MaxSideLots,WelfareTPPoints,WelfareLayer,
+      AutoRRMin,AutoRRMax,ProtectStartUSD,DailyMaxLossUSD,(int)EnableAutoParams,(int)AutoRRMode,
+      (double)((int)EnableWelfareOrder*2+(int)EnableSteppedTP));
+   uint h=2166136261;
+   for(int i=0;i<StringLen(t);i++){ h^=(uint)StringGetCharacter(t,i); h*=16777619; }
+   return (double)h;
+}
+void GVSet(string k,double v){ GlobalVariableSet(PanelKey(k),v); }
+double GVGet(string k,double def){ double v; return GlobalVariableGet(PanelKey(k),v)?v:def; }
+void SavePanelState()
+{
+   if(!RememberPanelValues) return;
+   GVSet("IN",InputsHash());
+   GVSet("LOT",g_lot); GVSet("LOTM",g_lotManual); GVSet("SHORT",g_shortMode); GVSet("TREND",g_trendFilter);
+   GVSet("FMON",g_floatMonitor); GVSet("FPCT",g_floatTriggerPct);
+   GVSet("SL",g_slPts); GVSet("TP",g_tpPts); GVSet("GAP",g_gapPts); GVSet("OFF",g_offsetPts); GVSet("CNT",g_orderCount);
+   GVSet("WTP",g_welfareTPPts); GVSet("WTPM",g_welfareTPManual); GVSet("WL",g_welfareLayer);
+   GVSet("MTO",g_maxTotalOrders); GVSet("MSL",g_maxSideLots);
+   GVSet("AUTO",g_autoParams); GVSet("RR",g_rrMode); GVSet("RRMIN",g_rrMin); GVSet("RRMAX",g_rrMax);
+   GVSet("PROT",g_protectUSD); GVSet("DML",g_dailyMaxLoss);
+   GVSet("WELF",g_welfareEnabled); GVSet("STEP",g_steppedTP); GVSet("TAKE",g_manualTakeover); GVSet("STATC",g_statsCollapsed);
+}
+bool LoadPanelState()
+{
+   double inH; if(!GlobalVariableGet(PanelKey("IN"),inH)) return false;
+   if(inH!=InputsHash()) return false;   // 参数栏改过：以参数栏为准
+   g_lot=NLot(GVGet("LOT",g_lot)); g_lotManual=GVGet("LOTM",0)!=0;
+   g_shortMode=GVGet("SHORT",g_shortMode)!=0; g_trendFilter=GVGet("TREND",g_trendFilter)!=0;
+   g_floatMonitor=GVGet("FMON",g_floatMonitor)!=0; g_floatTriggerPct=GVGet("FPCT",g_floatTriggerPct);
+   g_slPts=(int)GVGet("SL",g_slPts); g_tpPts=(int)GVGet("TP",g_tpPts); g_gapPts=(int)GVGet("GAP",g_gapPts);
+   g_offsetPts=(int)GVGet("OFF",g_offsetPts); g_orderCount=MathMax(1,MathMin(10,(int)GVGet("CNT",g_orderCount)));
+   g_welfareTPPts=(int)GVGet("WTP",g_welfareTPPts); g_welfareTPManual=GVGet("WTPM",0)!=0; g_welfareLayer=(int)GVGet("WL",g_welfareLayer);
+   g_maxTotalOrders=MathMax(1,(int)GVGet("MTO",g_maxTotalOrders)); g_maxSideLots=MathMax(0.0,GVGet("MSL",g_maxSideLots));
+   g_autoParams=GVGet("AUTO",g_autoParams)!=0; g_rrMode=GVGet("RR",g_rrMode)!=0;
+   g_rrMin=MathMax(0.1,GVGet("RRMIN",g_rrMin)); g_rrMax=MathMax(g_rrMin,GVGet("RRMAX",g_rrMax));
+   g_protectUSD=MathMax(0.0,GVGet("PROT",g_protectUSD)); g_dailyMaxLoss=MathMax(0.0,GVGet("DML",g_dailyMaxLoss));
+   g_welfareEnabled=GVGet("WELF",g_welfareEnabled)!=0; g_steppedTP=GVGet("STEP",g_steppedTP)!=0;
+   g_manualTakeover=GVGet("TAKE",g_manualTakeover)!=0; g_statsCollapsed=GVGet("STATC",g_statsCollapsed)!=0;
+   return true;
+}
+
+int OnInit()
+{
+ g_sprN=0;g_sprPos=0;g_restoredNote="";
+ ApplyInputDefaults();
+ if(RememberPanelValues && LoadPanelState()) g_restoredNote="｜已恢复上次面板数值";
  hAtrM5=iATR(_Symbol,PERIOD_M5,14);hAtrM15=iATR(_Symbol,PERIOD_M15,14);hAtrH1=iATR(_Symbol,PERIOD_H1,14);
- g_welfareEnabled=EnableWelfareOrder;g_steppedTP=EnableSteppedTP;g_floatTriggerPct=FloatProfitPct;g_panelHidden=false;
+ g_panelHidden=false;
  hRSI=iRSI(_Symbol,FilterTF(PERIOD_M5),RSIPeriod,PRICE_CLOSE);
  hADX=iADX(_Symbol,FilterTF(ADXTimeframe),ADXPeriod);
  hBands15=iBands(_Symbol,FilterTF(ChannelTimeframe),BollingerPeriod,0,BollingerDev1,PRICE_CLOSE); hBands25=iBands(_Symbol,FilterTF(ChannelTimeframe),BollingerPeriod,0,BollingerDev2,PRICE_CLOSE);
@@ -3910,11 +4036,12 @@ int OnInit()
 
  ChartSetInteger(0,CHART_EVENT_MOUSE_MOVE,true);
  EventSetMillisecondTimer(MathMax(250,PanelRefreshMs));
- g_status="幽灵狙击手 v2.85 就绪｜过滤周期 "+EnumToString(FilterTF(PERIOD_M5))+"｜佣金自学习+动态滑点缓冲+保护修改重试";
+ g_status="幽灵狙击手 v2.86 就绪｜过滤周期 "+EnumToString(FilterTF(PERIOD_M5))+"｜佣金自学习+动态滑点缓冲+保护修改重试"+g_restoredNote;
  Draw();return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason)
 {
+ SavePanelState();
  ChartSetInteger(0,CHART_EVENT_MOUSE_MOVE,false);
  EventKillTimer();
  if(hRSI!=INVALID_HANDLE)IndicatorRelease(hRSI);
