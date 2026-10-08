@@ -1,6 +1,6 @@
 #property strict
-#property version   "2.840"
-#property description "幽灵狙击手 - MT5黄金半自动交易与趋势过滤面板 v2.84 自动盈亏比版"
+#property version   "2.850"
+#property description "幽灵狙击手 - MT5黄金半自动交易与趋势过滤面板 v2.85 自动盈亏比版"
 
 #include <Trade/Trade.mqh>
 CTrade trade;
@@ -171,9 +171,10 @@ input bool         UnifiedTPExcludeWelfare = true; // 统一TP默认排除福利
 
 input group "=== v2.81 自动参数（按品种波动/点差自动计算） ==="
 input bool   EnableAutoParams      = true;  // 启动时开启自动参数（面板“自动参数”按钮可随时开关）
-input bool   AutoRRMode            = true;  // 盈亏比模式：止损按波动，止盈 = 止损 × 盈亏比（关=旧的小止盈大止损算法）
-input double AutoRRMin             = 1.5;   // 第1单的盈亏比（止盈/止损）
-input double AutoRRMax             = 2.0;   // 最后一单的盈亏比（排单止盈开启时各单在 Min~Max 之间递增）
+input bool   AutoRRMode            = false; // 启动时是否开启盈亏比模式（面板“盈亏比”按钮可随时开关）：止盈 = 止损 × 盈亏比
+input double AutoRRMin             = 1.5;   // 第1单的盈亏比（止盈/止损），面板可改
+input double AutoRRMax             = 2.0;   // 最后一单的盈亏比（排单止盈开启时各单在 Min~Max 之间递增），面板可改
+input double ProtectStartUSD       = 0.0;   // 普通单组合净盈利达到多少美元才开启自动保护（推保本/追踪），0=按点数触发；面板可改
 input double AutoSLScalpATR        = 1.2;   // 盈亏比模式·抢钱：止损 = M5 ATR × 此倍数
 input double AutoSLSniperATR       = 1.2;   // 盈亏比模式·狙击：止损 = M15 ATR × 此倍数
 input double AutoRR_BE             = 1.0;   // 盈亏比模式：净浮盈达到 止损×此倍数(=1R) 推保本
@@ -314,7 +315,9 @@ int g_wTrailStart=600,g_wTrailDist=350,g_wTrailStep=100,g_maxSpread=120;
 bool g_autoParams=true;
 bool g_autoReady=false;
 bool g_welfareTPManual=false;
-bool g_lotManual=false;        // 手动改过手数 → 按风险自动手数不再覆盖，直到重新开启自动参数   // 面板手动改过福利TP → 自动不再覆盖，直到重新开启自动参数
+bool g_lotManual=false;
+bool g_rrMode=false; double g_rrMin=1.5,g_rrMax=2.0;   // v2.85：盈亏比运行时设置（面板可改）
+double g_protectUSD=0.0;                                // v2.85：盈利达到多少美元开启自动保护（0=按点数）        // 手动改过手数 → 按风险自动手数不再覆盖，直到重新开启自动参数   // 面板手动改过福利TP → 自动不再覆盖，直到重新开启自动参数
 datetime g_autoLastBar=0;
 string g_autoInfo="自动参数：等待数据";
 int hAtrM5=INVALID_HANDLE,hAtrM15=INVALID_HANDLE,hAtrH1=INVALID_HANDLE;
@@ -699,12 +702,12 @@ color TrendLightColor(int s)
 }
 int ModeTP(){return g_tpPts;} int ModeGap(){return g_gapPts;} int ModeOffset(){return g_offsetPts;}
 int StepTPBase(){int v=ModeTP();if(v<=0)v=g_tpPts;return MathMax(1,v);}
-bool RRModeActive(){return g_autoParams && AutoRRMode && g_slPts>0;}
-// 第 index 单的盈亏比：排单止盈开启时在 AutoRRMin~AutoRRMax 之间均匀递增，否则都用 AutoRRMin
+bool RRModeActive(){return g_rrMode && g_slPts>0;}
+// 第 index 单的盈亏比：排单止盈开启时在 最小RR~最大RR 之间均匀递增，否则都用最小RR
 double LayerRR(int index)
 {
    int n=MathMax(1,g_orderCount);
-   double lo=MathMax(0.1,AutoRRMin), hi=MathMax(lo,AutoRRMax);
+   double lo=MathMax(0.1,g_rrMin), hi=MathMax(lo,g_rrMax);
    if(!g_steppedTP || n<=1) return lo;
    return lo+(hi-lo)*MathMin(1.0,(double)index/(n-1));
 }
@@ -2470,12 +2473,20 @@ void ProcessModifyRetryQueue()
    }
 }
 
+// 组合扣除成本后的净盈利（美元）
+double GroupNetMoney(double lots,double netPts){ return netPts*MoneyPerPointPerLot()*lots; }
+
+// 盈亏比模式下手动参数：止盈跟随止损×最小RR
+void SyncTPWithRR(){ if(g_rrMode && g_slPts>0) g_tpPts=(int)MathMax(1,MathRound(g_slPts*MathMax(0.1,g_rrMin))); }
+
 int ProtectGroupAtAverage(ENUM_POSITION_TYPE ty,int &skipped)
 {
    skipped=0;
    int count=0;double lots=0,avg=0,costPts=0,cur=0,netPts=0;
    if(!GroupProtectionData(ty,count,lots,avg,costPts,cur,netPts))return 0;
-   if(netPts<g_beTrig){skipped=count;return 0;}
+   // v2.85：设了“盈利达到$X开启保护”时，按组合净盈利金额触发；否则按点数触发
+   if(g_protectUSD>0){ if(GroupNetMoney(lots,netPts)<g_protectUSD){skipped=count;return 0;} }
+   else if(netPts<g_beTrig){skipped=count;return 0;}
 
    long stops=(long)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL);
    long freeze=(long)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_FREEZE_LEVEL);
@@ -2528,6 +2539,7 @@ void AutoProtect()
       int count=0;double lots=0,avg=0,costPts=0,cur=0,netPts=0;
       if(!GroupProtectionData(ty,count,lots,avg,costPts,cur,netPts))continue;
       if(netPts<g_trailTrig)continue;
+      if(g_protectUSD>0 && GroupNetMoney(lots,netPts)<g_protectUSD)continue;   // 未达到保护金额不追踪
 
       double groupFloor=(ty==POSITION_TYPE_BUY ? avg+(costPts+g_bePlus)*_Point
                                                : avg-(costPts+g_bePlus)*_Point);
@@ -3150,8 +3162,8 @@ void ApplyEdit(string key,string text)
  bool autoTurnedOff=(manualCore && g_autoParams);
  if(autoTurnedOff) g_autoParams=false;   // 手动改核心参数 → 自动参数关闭，不再被覆盖
 
- if(key=="SLV"){g_slPts=MathMax(0,v);g_status="止损距离已改为 "+IntegerToString(g_slPts)+" 点";}
- else if(key=="TPV"){g_tpPts=MathMax(1,v);g_status="止盈点数已改为 "+IntegerToString(g_tpPts)+" 点";}
+ if(key=="SLV"){g_slPts=MathMax(0,v);SyncTPWithRR();g_status="止损距离已改为 "+IntegerToString(g_slPts)+" 点"+(g_rrMode?"（止盈按盈亏比同步为 "+IntegerToString(g_tpPts)+"）":"");}
+ else if(key=="TPV"){g_tpPts=MathMax(1,v);if(g_rrMode){g_rrMode=false;g_status="止盈点数已改为 "+IntegerToString(g_tpPts)+" 点（手动止盈，盈亏比模式已关闭）";}else g_status="止盈点数已改为 "+IntegerToString(g_tpPts)+" 点";}
  else if(key=="OFV"){g_offsetPts=MathMax(0,v);g_status="排单偏移已改为 "+IntegerToString(g_offsetPts)+" 点";}
  else if(key=="GPV"){g_gapPts=MathMax(1,v);g_status="排单间距已改为 "+IntegerToString(g_gapPts)+" 点";}
  else if(key=="CNTV"){g_orderCount=MathMax(1,MathMin(10,v));g_status="每次单数已改为 "+IntegerToString(g_orderCount);}
@@ -3163,6 +3175,23 @@ void ApplyEdit(string key,string text)
     g_lotManual=true;
     g_status="手数已改为 "+DoubleToString(g_lot,2)+
              (want>MaxPanelLot+1e-9?StringFormat("（超过面板最大手数 %.2f，已限制；可在参数 MaxPanelLot 调大）",MaxPanelLot):"");
+ }
+ else if(key=="RRMIN")
+ {
+    g_rrMin=MathMax(0.5,MathMin(10.0,d)); if(g_rrMax<g_rrMin) g_rrMax=g_rrMin;
+    SyncTPWithRR(); RecalcAutoParams(true);
+    g_status=StringFormat("盈亏比已改为 %.1f ~ %.1f%s",g_rrMin,g_rrMax,g_rrMode?"":"（盈亏比模式未开启）");
+ }
+ else if(key=="RRMAX")
+ {
+    g_rrMax=MathMax(g_rrMin,MathMin(10.0,d));
+    RecalcAutoParams(true);
+    g_status=StringFormat("盈亏比已改为 %.1f ~ %.1f%s",g_rrMin,g_rrMax,g_rrMode?"":"（盈亏比模式未开启）");
+ }
+ else if(key=="PROTV")
+ {
+    g_protectUSD=MathMax(0.0,d);
+    g_status=(g_protectUSD>0?StringFormat("普通单组合净盈利达到 $%.0f 时开启自动保护",g_protectUSD):"自动保护改为按点数触发");
  }
  else if(key=="MTV"){g_maxTotalOrders=MathMax(1,v);g_status="总单数上限已改为 "+IntegerToString(g_maxTotalOrders)+" 单";}
  else if(key=="MSV")
@@ -3336,7 +3365,7 @@ void Draw()
  int panelH=1055+statShift;
 
  Rect("BG",x,y,w,panelH,C'20,22,27');
- Txt("TITLE",x+10,y+7,"幽灵狙击手  MT5 v2.84 AUTO RR",11,C'255,210,40');
+ Txt("TITLE",x+10,y+7,"幽灵狙击手  MT5 v2.85 AUTO RR",11,C'255,210,40');
  Btn("HIDE",x+345,y+5,60,20,"隐藏 O",C'55,65,80');
  Txt("MODE",x+10,y+26,"Ghost Sniper · 黄金半自动交易/趋势过滤系统",8,C'210,210,210');
 
@@ -3347,7 +3376,8 @@ void Draw()
  EditBox("LOTV",x+50,y+65,68,22,DoubleToString(g_lot,2));   // v2.83：手数可直接输入
  Btn("LM",x+125,y+65,45,22,"-手",C'80,80,90');
  Btn("LP",x+175,y+65,45,22,"+手",C'80,80,90');
- Btn("AUTO",x+230,y+65,175,22,g_autoParams?"自动参数 ● 开":"自动参数 ○ 关(手动)",g_autoParams?C'0,110,120':C'85,85,85');
+ Btn("AUTO",x+226,y+65,88,22,g_autoParams?"自动 ● 开":"自动 ○ 关",g_autoParams?C'0,110,120':C'85,85,85');
+ Btn("RRB",x+318,y+65,87,22,g_rrMode?"盈亏比 ● 开":"盈亏比 ○ 关",g_rrMode?C'120,80,0':C'85,85,85');
 
  Btn("B7",x+10,y+94,125,29,"▲ 狙击多 [7]",C'0,120,35');
  Btn("B8",x+145,y+94,125,29,"▲ 排单多 [8]",C'0,105,75');
@@ -3357,7 +3387,10 @@ void Draw()
  Btn("S2",x+145,y+129,125,29,"▼ 排单空 [2]",C'145,55,25');
  Btn("S3",x+280,y+129,125,29,"平空单 [3]",C'145,35,35');
 
- Txt("PROT",x+10,y+165,"面板快速参数（双击数值 → 输入 → Enter，立即生效）",8,C'110,230,130');
+ Txt("PROT",x+10,y+165,"快速参数（双击→输入→Enter）",8,C'110,230,130');
+ Txt("PUT",x+205,y+165,"盈利≥$",8,C'110,230,130');
+ EditBox("PROTV",x+252,y+161,60,20,(g_protectUSD>0?DoubleToString(g_protectUSD,0):"按点数"));
+ Txt("PUT2",x+318,y+165,"开启保护",8,C'110,230,130');
  Txt("SLT",x+10,y+184,"止损",8);
  EditBox("SLV",x+58,y+180,105,21,IntegerToString(g_slPts));
 
@@ -3384,9 +3417,10 @@ void Draw()
  EditBox("MTV",x+58,y+251,60,20,IntegerToString(g_maxTotalOrders));
  Txt("MST",x+126,y+255,"单边",8,C'230,200,80');
  EditBox("MSV",x+160,y+251,60,20,(g_maxSideLots>0?DoubleToString(g_maxSideLots,2):"不限"));
- Txt("LAD",x+226,y+255,
-     "手 | 浮盈 "+DoubleToString(g_floatTriggerPct,0)+"%→普通单减仓",
-     8,C'230,200,80');
+ Txt("LAD",x+224,y+255,"手 RR",8,C'230,200,80');
+ EditBox("RRMIN",x+262,y+251,58,20,DoubleToString(g_rrMin,1));
+ Txt("RRT",x+325,y+255,"~",8,C'230,200,80');
+ EditBox("RRMAX",x+340,y+251,58,20,DoubleToString(g_rrMax,1));
 
  // =========================
  // 持仓统计：可折叠区域
@@ -3671,6 +3705,13 @@ void Action(string a)
  }
  else if(a=="SHORT"){g_shortMode=true;g_tpPts=ShortTPPoints;g_gapPts=ShortLadderGap;g_offsetPts=ShortLadderOffset;g_status="已切换抢钱模式并载入抢钱参数";}
  else if(a=="LONG"){g_shortMode=false;g_tpPts=LongTPPoints;g_gapPts=LongLadderGap;g_offsetPts=LongLadderOffset;g_status="已切换狙击模式并载入狙击参数";}
+ else if(a=="RRB")
+ {
+   g_rrMode=!g_rrMode;
+   if(g_autoParams) RecalcAutoParams(true); else SyncTPWithRR();
+   g_status=g_rrMode?StringFormat("盈亏比模式已开启：止盈 = 止损 × %.1f~%.1f",g_rrMin,g_rrMax)
+                    :"盈亏比模式已关闭"+string(g_autoParams?"：自动参数恢复原算法":"：止盈保持当前数值，可在面板修改");
+ }
  else if(a=="AUTO")
  {
    g_autoParams=!g_autoParams;
@@ -3794,7 +3835,7 @@ void OnChartEvent(const int id,const long &lp,const double &dp,const string &sp)
    if(StringFind(sp,PX)==0)
    {
       string key=StringSubstr(sp,StringLen(PX));
-      if(key=="SLV"||key=="TPV"||key=="OFV"||key=="GPV"||key=="CNTV"||key=="WTV"||key=="WLV"||key=="MTV"||key=="MSV"||key=="LOTV")
+      if(key=="SLV"||key=="TPV"||key=="OFV"||key=="GPV"||key=="CNTV"||key=="WTV"||key=="WLV"||key=="MTV"||key=="MSV"||key=="LOTV"||key=="RRMIN"||key=="RRMAX"||key=="PROTV")
       {
          ApplyEdit(key,ObjectGetString(0,sp,OBJPROP_TEXT));return;
       }
@@ -3803,7 +3844,7 @@ void OnChartEvent(const int id,const long &lp,const double &dp,const string &sp)
  if(id==CHARTEVENT_OBJECT_CLICK)
  {
    string a=sp;if(StringFind(a,PX)==0)a=StringSubstr(a,StringLen(PX));
-   if(a=="SLV"||a=="TPV"||a=="OFV"||a=="GPV"||a=="CNTV"||a=="WTV"||a=="WLV"||a=="MTV"||a=="MSV"||a=="LOTV"){g_editFocus=true;return;}
+   if(a=="SLV"||a=="TPV"||a=="OFV"||a=="GPV"||a=="CNTV"||a=="WTV"||a=="WLV"||a=="MTV"||a=="MSV"||a=="LOTV"||a=="RRMIN"||a=="RRMAX"||a=="PROTV"){g_editFocus=true;return;}
    g_editFocus=false;
 
    // 先弹起按钮再执行交易，避免同步下单期间按钮看起来“卡死”。
@@ -3853,6 +3894,7 @@ int OnInit()
  g_beTrig=BreakEvenTriggerPts;g_bePlus=BreakEvenPlusPts;g_trailTrig=TrailTriggerPts;g_trailDist=TrailDistancePts;g_trailStep=TrailStepPts;
  g_wTrailStart=WelfareTrailStartPts;g_wTrailDist=WelfareTrailDistancePts;g_wTrailStep=WelfareTrailStepPts;g_maxSpread=MaxSpreadPoints;
  g_autoParams=EnableAutoParams;g_autoReady=false;g_sprN=0;g_sprPos=0;
+ g_rrMode=AutoRRMode;g_rrMin=MathMax(0.1,AutoRRMin);g_rrMax=MathMax(g_rrMin,AutoRRMax);g_protectUSD=MathMax(0.0,ProtectStartUSD);SyncTPWithRR();
  hAtrM5=iATR(_Symbol,PERIOD_M5,14);hAtrM15=iATR(_Symbol,PERIOD_M15,14);hAtrH1=iATR(_Symbol,PERIOD_H1,14);
  g_welfareEnabled=EnableWelfareOrder;g_steppedTP=EnableSteppedTP;g_floatTriggerPct=FloatProfitPct;g_panelHidden=false;
  hRSI=iRSI(_Symbol,FilterTF(PERIOD_M5),RSIPeriod,PRICE_CLOSE);
@@ -3868,7 +3910,7 @@ int OnInit()
 
  ChartSetInteger(0,CHART_EVENT_MOUSE_MOVE,true);
  EventSetMillisecondTimer(MathMax(250,PanelRefreshMs));
- g_status="幽灵狙击手 v2.84 就绪｜过滤周期 "+EnumToString(FilterTF(PERIOD_M5))+"｜佣金自学习+动态滑点缓冲+保护修改重试";
+ g_status="幽灵狙击手 v2.85 就绪｜过滤周期 "+EnumToString(FilterTF(PERIOD_M5))+"｜佣金自学习+动态滑点缓冲+保护修改重试";
  Draw();return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason)
@@ -4046,12 +4088,12 @@ void RecalcAutoParams(bool force)
    int gap=(int)MathRound(MathMax((sc?a5*AutoGapScalp:a15*AutoGapSniper),MathMax(spr*2.0,minDist)));
    int sl=(int)MathRound(MathMax(a60*AutoSLATRH1,MathMax(tp*2.0,minDist*3)));
 
-   if(AutoRRMode)
+   if(g_rrMode)
    {
       // v2.84 盈亏比模式：止损按入场周期的波动定，止盈 = 止损 × 盈亏比；保护按 R 设置
       double slb=(sc ? a5*AutoSLScalpATR : a15*AutoSLSniperATR);
       sl=(int)MathRound(MathMax(slb,MathMax(cost*4.0,minDist*3)));
-      tp=(int)MathRound(sl*MathMax(0.1,AutoRRMin));
+      tp=(int)MathRound(sl*MathMax(0.1,g_rrMin));
       g_tpPts=tp; g_gapPts=gap; g_offsetPts=gap; g_slPts=sl;
       g_beTrig   =(int)MathRound(MathMax(sl*AutoRR_BE,cost*2.0));
       g_bePlus   =(int)MathRound(MathMax(sl*0.10,spr));
@@ -4092,7 +4134,7 @@ void RecalcAutoParams(bool force)
 
    g_autoInfo=StringFormat("自动[%s·%s] ATR5/15/60 %.0f/%.0f/%.0f 点差%.0f｜SL%d TP%d%s 距%d 福利TP%d%s｜保本%d 追%d/%d%s",
                            SymbolClassText(),sc?"抢钱":"狙击",a5,a15,a60,spr,sl,tp,
-                           AutoRRMode?StringFormat("(RR %.1f~%.1f)",AutoRRMin,(g_steppedTP?MathMax(AutoRRMin,AutoRRMax):AutoRRMin)):"",
+                           g_rrMode?StringFormat("(RR %.1f~%.1f)",g_rrMin,(g_steppedTP?MathMax(g_rrMin,g_rrMax):g_rrMin)):"",
                            gap,g_welfareTPPts,g_welfareTPManual?"(手动)":"",
                            g_beTrig,g_trailTrig,g_trailDist,lotTxt);
 }
