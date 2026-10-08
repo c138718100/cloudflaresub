@@ -177,7 +177,7 @@ input int          EmergencyWindowSec   = 2; // 二次确认有效时间(秒)
 
 input group "=== 快捷键(ASCII/虚拟键码) ==="
 // 字母主键可自定义；数字键固定按面板标注：
-// 7狙击多 8排单多 9平多 | 1狙击空 2排单空 3平空 | 4平浮盈 5均价推保 6平浮亏 | 0紧急全平 | .删除挂单
+// 7狙击多 8排单多 9平多 | 1狙击空 2排单空 3平空 | 4平浮盈 5均价推保 6平浮亏 | 0紧急全平 | .删除挂单 | 空格暂停
 input int          MarketBuyKey          = 66;  // 狙击买主键(B)
 input int          LadderBuyKey          = 78;  // 排单买主键(N)
 input int          MarketSellKey         = 83;  // 狙击卖主键(S)
@@ -3313,7 +3313,7 @@ void Draw()
 
  Btn("DEL",x+10,y+655+sy,125,26,"删除挂单 [.]",C'155,125,45');
  Btn("PAUSE",x+145,y+655+sy,125,26,
-     g_pause?"▶ 恢复":"⏸ 暂停",
+     g_pause?"▶ 恢复 [空格]":"⏸ 暂停 [空格]",
      g_pause?C'30,130,70':C'80,85,100');
  Btn("ALL",x+280,y+655+sy,125,26,"紧急全平 [0]",C'180,35,35');
 
@@ -3373,7 +3373,7 @@ void Draw()
      "小键盘: 7狙击多 8排单多 9平多 | 1狙击空 2排单空 3平空 | 4平浮盈 5推保 6平浮亏",
      7,C'170,180,190');
  Txt("KEY2",x+10,y+984+sy,
-     "0紧急全平(按两次) | .删除挂单 | +/-手数 | O隐藏/显示",
+     "0紧急全平(按两次) | .删除挂单 | 空格暂停 | +/-手数 | O隐藏",
      7,C'170,180,190');
 
  ChartRedraw();
@@ -3544,6 +3544,7 @@ void OnChartEvent(const int id,const long &lp,const double &dp,const string &sp)
    else if(                     k==54 || (np&&k==102)) Action("LOSS");  // 6 平浮亏
    else if(                     k==48 || (np&&k==96))  Action("ALL");   // 0 紧急全平（二次确认）
    else if(k==46 || (np&&k==110))                      Action("DEL");   // . 删除挂单
+   else if(k==32)                                      Action("PAUSE"); // 空格 暂停/恢复
    else if(np && k==107)                               Action("LP");    // + 手数
    else if(np && k==109)                               Action("LM");    // - 手数
  }
