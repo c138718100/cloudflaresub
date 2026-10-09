@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Jammy"
 #property version   "1.50"
-#property description "Jammy ICT Suite v1.52：SMT / 结构(BOS·CHoCH) / FVG / OB / 流动性 / 折价溢价·OTE / Killzone / CRT"
+#property description "Jammy ICT Suite v1.53：SMT / 结构(BOS·CHoCH) / FVG / OB / 流动性 / 折价溢价·OTE / Killzone / CRT"
 #property indicator_chart_window
 #property indicator_buffers 0
 #property indicator_plots   0
@@ -85,6 +85,10 @@ input int    CRTAvgBars          = 10;    // 平均区间取前几根
 input bool   CRTNeedKeyLevel     = true;  // 被扫的必须是关键高/低点：C1 的高(低)点是前N根里最高(最低)
 input int    CRTKeyBars          = 5;     // 关键高/低点回看根数
 input bool   CRTReversalSideOnly = true;  // 只认反转方向：阳线动量被扫高→空；阴线动量被扫低→多
+input int    CRTMaxBars          = 6;     // 确认后最多等几根K线到达目标，超出算失败
+input bool   CRTTargetFullRange  = true;  // 目标：true=C1区间另一端，false=C1区间50%
+input bool   CRTInvalidOnBreak   = true;  // 收盘突破C2扫点（空=C2高点，多=C2低点）提前判失败
+input bool   CRTShowFailed       = true;  // 失败的CRT也显示（灰色）
 input bool   AlertOnCHoCH        = true;
 input bool   AlertOnSweep        = false;
 input int    AlertRecentBars     = 2;     // 只对最近几根K线内出现的信号提醒
@@ -528,6 +532,25 @@ void Killzones()
 //+------------------------------------------------------------------+
 //| CRT：高周期前一根K线区间被扫后收回                                   |
 //+------------------------------------------------------------------+
+// CRT 结果：c2=扫点K线下标，newer=-1(时间序列数组)/+1(正序数组) 指向更新的K线
+// 返回 1=成功（第k根到达目标） -1=失败（why=原因） 0=还在等待（已过k根）
+int CRTOutcome(const MqlRates &r[],int c2,int newer,int got,bool bear,double target,double invalid,int &k,string &why)
+{
+   k=0; why="";
+   int lastIdx=(newer<0?0:got-1);                        // 进行中的K线
+   for(int m=1;m<=CRTMaxBars;m++)
+   {
+      int idx=c2+newer*m; if(idx<0 || idx>=got) break;
+      k=m;
+      if(bear ? r[idx].low<=target : r[idx].high>=target) return 1;
+      if(CRTInvalidOnBreak && idx!=lastIdx && (bear ? r[idx].close>invalid : r[idx].close<invalid))
+      { why="收盘破扫点"; return -1; }
+   }
+   int endIdx=c2+newer*CRTMaxBars;
+   if(k>=CRTMaxBars && endIdx!=lastIdx) { why="超"+IntegerToString(CRTMaxBars)+"根未到目标"; return -1; }
+   return 0;
+}
+
 // CRT 过滤：c1=区间K线下标，older=+1(时间序列数组)/-1(正序数组) 指向更早的K线
 bool CRTQualify(const MqlRates &r[],int c1,int older,int got,bool bear)
 {
@@ -559,10 +582,11 @@ void CRT()
    g_crtText="";
    if(!ShowCRT || PeriodSeconds(CRT_TF)<=PeriodSeconds()) { if(ShowCRT) g_crtText="CRT 需高于当前周期"; return; }
    MqlRates r[]; ArraySetAsSeries(r,true);
-   int got=CopyRates(_Symbol,CRT_TF,0,CRTLookback+2+MathMax(CRTAvgBars,CRTKeyBars),r);
+   int look=MathMax(CRTLookback,CRTMaxBars+1);          // 至少回看到能判出成败
+   int got=CopyRates(_Symbol,CRT_TF,0,look+2+MathMax(CRTAvgBars,CRTKeyBars),r);
    if(got<3) return;
 
-   for(int j=MathMin(CRTLookback,got-2);j>=0;j--)
+   for(int j=MathMin(look,got-2);j>=0;j--)
    {
       // C1=r[j+1]（区间K线）  C2=r[j]（扫区间的K线，j=0 为进行中）
       double h1=r[j+1].high, l1=r[j+1].low, mid=(h1+l1)/2;
@@ -581,16 +605,29 @@ void CRT()
       if(!bear && !bull) continue;
 
       string id=IntegerToString((long)t1);
-      color c=bear?clrTomato:clrLimeGreen;
+      double target=(CRTTargetFullRange ? (bear?l1:h1) : mid);
+      int k=0; string why=""; int res=0; string st;
+      datetime P=(datetime)PeriodSeconds(CRT_TF);
+      datetime wEnd=r[j].time+(CRTMaxBars+1)*P;            // 等待窗口结束（C2 后 N 根）
+      if(live) st="形成中";
+      else
+      {
+         res=CRTOutcome(r,j,-1,got,bear,target,bear?r[j].high:r[j].low,k,why);
+         if(res>0)      { st=StringFormat("✔成功(第%d根)",k); wEnd=r[j-k].time+P; }
+         else if(res<0) { st="✘失败("+why+")"; if(k>0) wEnd=r[j-k].time+P; }
+         else           st=StringFormat("等待 %d/%d",k,CRTMaxBars);
+      }
+      if(res<0 && !CRTShowFailed) continue;
+      color c=(res<0?clrDimGray:(bear?clrTomato:clrLimeGreen));
       Rect("CRT"+id,t1,h1,t2,l1,c,false,STYLE_SOLID);
       Seg("CRTm"+id,t1,mid,t2,mid,c,STYLE_DOT);
-      string label=StringFormat("CRT%s %s｜目标 %s",bear?"空":"多",live?"(进行中)":"",
-                                DoubleToString(bear?l1:h1,_Digits));
+      Seg("CRTg"+id,t2,target,wEnd,target,c,STYLE_DASH);   // 目标线画到 N 根窗口结束
+      string label=StringFormat("CRT%s｜目标 %s｜%s",bear?"空":"多",DoubleToString(target,_Digits),st);
       Txt("CRTt"+id,t1,bear?h1:l1,label,c,8,bear?ANCHOR_LEFT_LOWER:ANCHOR_LEFT_UPPER);
-      if(j<=1)
+      if(res==0 && j<=CRTMaxBars)
       {
-         g_crtText=StringFormat("%s %s：扫%s %s 后收回，目标 50%% %s / 区间%s %s",
-                   StringSubstr(EnumToString(CRT_TF),7),bear?"空":"多",bear?"前高":"前低",DoubleToString(bear?h1:l1,_Digits),
+         g_crtText=StringFormat("%s %s %s：扫%s %s 后收回，目标 50%% %s / 区间%s %s",
+                   StringSubstr(EnumToString(CRT_TF),7),bear?"空":"多",st,bear?"前高":"前低",DoubleToString(bear?h1:l1,_Digits),
                    DoubleToString(mid,_Digits),bear?"低":"高",DoubleToString(bear?l1:h1,_Digits));
          if(AlertOnCRT) Notify("CRT"+id+(bear?"S":"B"),"CRT"+(bear?"空":"多")+"："+g_crtText,1);
       }

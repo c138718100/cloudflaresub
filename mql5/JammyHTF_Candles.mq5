@@ -4,8 +4,8 @@
 //|   + 高周期 CRT 标记 + 未回补 FVG + 开盘价/前高前低 + 收盘倒计时       |
 //+------------------------------------------------------------------+
 #property copyright "Jammy"
-#property version   "1.01"
-#property description "Jammy HTF Candles v1.01：在小周期图表右侧显示两个高周期的最近K线（按真实价格），标出 CRT、未回补 FVG、高周期开盘价/前高前低，并显示收盘倒计时"
+#property version   "1.02"
+#property description "Jammy HTF Candles v1.02：在小周期图表右侧显示两个高周期的最近K线（按真实价格），标出 CRT、未回补 FVG、高周期开盘价/前高前低，并显示收盘倒计时"
 #property indicator_chart_window
 #property indicator_plots 0
 
@@ -45,6 +45,10 @@ input int    CRTAvgBars          = 10;    // 平均区间取前几根
 input bool   CRTNeedKeyLevel     = true;  // 被扫的必须是关键高/低点：C1 的高(低)点是前N根里最高(最低)
 input int    CRTKeyBars          = 5;     // 关键高/低点回看根数
 input bool   CRTReversalSideOnly = true;  // 只认反转方向：阳线动量被扫高→空；阴线动量被扫低→多
+input int    CRTMaxBars          = 6;     // 确认后最多等几根K线到达目标，超出算失败
+input bool   CRTTargetFullRange  = true;  // 目标：true=C1区间另一端，false=C1区间50%
+input bool   CRTInvalidOnBreak   = true;  // 收盘突破C2扫点（空=C2高点，多=C2低点）提前判失败
+input bool   CRTShowFailed       = true;  // 失败的CRT也显示（灰色）
 
 string   PFX="JHTF_";
 string   g_used[];
@@ -147,6 +151,25 @@ void SweepUnused()
    }
 }
 
+// CRT 结果：c2=扫点K线下标，newer=-1(时间序列数组)/+1(正序数组) 指向更新的K线
+// 返回 1=成功（第k根到达目标） -1=失败（why=原因） 0=还在等待（已过k根）
+int CRTOutcome(const MqlRates &r[],int c2,int newer,int got,bool bear,double target,double invalid,int &k,string &why)
+{
+   k=0; why="";
+   int lastIdx=(newer<0?0:got-1);                        // 进行中的K线
+   for(int m=1;m<=CRTMaxBars;m++)
+   {
+      int idx=c2+newer*m; if(idx<0 || idx>=got) break;
+      k=m;
+      if(bear ? r[idx].low<=target : r[idx].high>=target) return 1;
+      if(CRTInvalidOnBreak && idx!=lastIdx && (bear ? r[idx].close>invalid : r[idx].close<invalid))
+      { why="收盘破扫点"; return -1; }
+   }
+   int endIdx=c2+newer*CRTMaxBars;
+   if(k>=CRTMaxBars && endIdx!=lastIdx) { why="超"+IntegerToString(CRTMaxBars)+"根未到目标"; return -1; }
+   return 0;
+}
+
 // CRT 过滤：c1=区间K线下标，older=+1(时间序列数组)/-1(正序数组) 指向更早的K线
 bool CRTQualify(const MqlRates &r[],int c1,int older,int got,bool bear)
 {
@@ -218,8 +241,16 @@ void DrawGroup(int gi,ENUM_TIMEFRAMES tf,int startBar,int n,int W,int G,datetime
          if(bear || bull)
          {
             bool live=(i==got-1);
-            TextObj("C"+k,tc,r[i].high+pad*0.3,(bear?"CRT▼":"CRT▲")+(live?"*":""),
-                    bear?BearColor:BullColor,FontSize-1,ANCHOR_LOWER);
+            double target=(CRTTargetFullRange ? (bear?pl:ph) : (ph+pl)/2);
+            int kk=0; string why=""; int res=0; string st="*";
+            if(!live)
+            {
+               res=CRTOutcome(r,i,1,got,bear,target,bear?r[i].high:r[i].low,kk,why);
+               st=(res>0?" ✔"+IntegerToString(kk):(res<0?" ✘":StringFormat(" %d/%d",kk,CRTMaxBars)));
+            }
+            if(!(res<0 && !CRTShowFailed))
+               TextObj("C"+k,tc,r[i].high+pad*0.3,(bear?"CRT▼":"CRT▲")+st,
+                       res<0?clrDimGray:(bear?BearColor:BullColor),FontSize-1,ANCHOR_LOWER);
             if(AlertOnCRT && i==got-2)                    // 刚收盘的一根
             {
                string key=tn+IntegerToString((long)r[i].time)+(bear?"S":"B");
