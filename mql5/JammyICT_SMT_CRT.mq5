@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Jammy"
 #property version   "1.50"
-#property description "Jammy ICT Suite v1.51：SMT / 结构(BOS·CHoCH) / FVG / OB / 流动性 / 折价溢价·OTE / Killzone / CRT"
+#property description "Jammy ICT Suite v1.52：SMT / 结构(BOS·CHoCH) / FVG / OB / 流动性 / 折价溢价·OTE / Killzone / CRT"
 #property indicator_chart_window
 #property indicator_buffers 0
 #property indicator_plots   0
@@ -77,6 +77,14 @@ input bool   AlertPopup          = true;
 input bool   AlertPush           = false; // 推送到手机（需配置 MetaQuotes ID）
 input bool   AlertOnSMT          = true;
 input bool   AlertOnCRT          = true;
+input group "=== CRT 判定（动量K线 + 扫关键高/低 + 收回） ==="
+input bool   CRTNeedMomentum     = true;  // C1 必须是动量K线（实体大、区间明显大于近期平均）
+input double CRTMomBodyPct       = 0.55;  // 动量：C1 实体 ≥ C1 区间 × 此比例
+input double CRTMomRangeMult     = 1.2;   // 动量：C1 区间 ≥ 前N根平均区间 × 此倍数
+input int    CRTAvgBars          = 10;    // 平均区间取前几根
+input bool   CRTNeedKeyLevel     = true;  // 被扫的必须是关键高/低点：C1 的高(低)点是前N根里最高(最低)
+input int    CRTKeyBars          = 5;     // 关键高/低点回看根数
+input bool   CRTReversalSideOnly = true;  // 只认反转方向：阳线动量被扫高→空；阴线动量被扫低→多
 input bool   AlertOnCHoCH        = true;
 input bool   AlertOnSweep        = false;
 input int    AlertRecentBars     = 2;     // 只对最近几根K线内出现的信号提醒
@@ -520,12 +528,38 @@ void Killzones()
 //+------------------------------------------------------------------+
 //| CRT：高周期前一根K线区间被扫后收回                                   |
 //+------------------------------------------------------------------+
+// CRT 过滤：c1=区间K线下标，older=+1(时间序列数组)/-1(正序数组) 指向更早的K线
+bool CRTQualify(const MqlRates &r[],int c1,int older,int got,bool bear)
+{
+   double h1=r[c1].high, l1=r[c1].low, rng=h1-l1;
+   if(rng<=0) return false;
+   bool c1Bull=(r[c1].close>r[c1].open);
+   if(CRTReversalSideOnly && bear!=c1Bull) return false;
+   if(CRTNeedMomentum)
+   {
+      if(MathAbs(r[c1].close-r[c1].open)<CRTMomBodyPct*rng) return false;
+      double s=0; int m=0;
+      for(int k=1;k<=CRTAvgBars;k++) { int idx=c1+older*k; if(idx<0 || idx>=got) break; s+=r[idx].high-r[idx].low; m++; }
+      if(m>0 && rng<CRTMomRangeMult*s/m) return false;
+   }
+   if(CRTNeedKeyLevel)
+   {
+      for(int k=1;k<=CRTKeyBars;k++)
+      {
+         int idx=c1+older*k; if(idx<0 || idx>=got) break;
+         if(bear && r[idx].high>h1) return false;
+         if(!bear && r[idx].low<l1) return false;
+      }
+   }
+   return true;
+}
+
 void CRT()
 {
    g_crtText="";
    if(!ShowCRT || PeriodSeconds(CRT_TF)<=PeriodSeconds()) { if(ShowCRT) g_crtText="CRT 需高于当前周期"; return; }
    MqlRates r[]; ArraySetAsSeries(r,true);
-   int got=CopyRates(_Symbol,CRT_TF,0,CRTLookback+2,r);
+   int got=CopyRates(_Symbol,CRT_TF,0,CRTLookback+2+MathMax(CRTAvgBars,CRTKeyBars),r);
    if(got<3) return;
 
    for(int j=MathMin(CRTLookback,got-2);j>=0;j--)
@@ -542,6 +576,8 @@ void CRT()
 
       bool bear=(r[j].high>h1 && c2close<h1 && c2close>l1);   // 扫高点收回 → 目标区间低点
       bool bull=(r[j].low<l1  && c2close>l1 && c2close<h1);   // 扫低点收回 → 目标区间高点
+      if(bear && !CRTQualify(r,j+1,1,got,true))  bear=false;
+      if(bull && !CRTQualify(r,j+1,1,got,false)) bull=false;
       if(!bear && !bull) continue;
 
       string id=IntegerToString((long)t1);

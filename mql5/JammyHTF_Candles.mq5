@@ -4,8 +4,8 @@
 //|   + 高周期 CRT 标记 + 未回补 FVG + 开盘价/前高前低 + 收盘倒计时       |
 //+------------------------------------------------------------------+
 #property copyright "Jammy"
-#property version   "1.00"
-#property description "Jammy HTF Candles v1.00：在小周期图表右侧显示两个高周期的最近K线（按真实价格），标出 CRT、未回补 FVG、高周期开盘价/前高前低，并显示收盘倒计时"
+#property version   "1.01"
+#property description "Jammy HTF Candles v1.01：在小周期图表右侧显示两个高周期的最近K线（按真实价格），标出 CRT、未回补 FVG、高周期开盘价/前高前低，并显示收盘倒计时"
 #property indicator_chart_window
 #property indicator_plots 0
 
@@ -36,6 +36,15 @@ input bool            ShowLevels       = true;        // 当前高周期开盘�
 input bool            ShowCountdown    = true;        // 高周期收盘倒计时
 input bool            ShowTimeLabels   = true;        // K线下方显示时间（服务器时间；日线显示星期）
 input bool            AlertOnCRT       = false;       // 高周期K线收盘形成 CRT 时弹窗+推送
+
+input group "=== CRT 判定（动量K线 + 扫关键高/低 + 收回） ==="
+input bool   CRTNeedMomentum     = true;  // C1 必须是动量K线（实体大、区间明显大于近期平均）
+input double CRTMomBodyPct       = 0.55;  // 动量：C1 实体 ≥ C1 区间 × 此比例
+input double CRTMomRangeMult     = 1.2;   // 动量：C1 区间 ≥ 前N根平均区间 × 此倍数
+input int    CRTAvgBars          = 10;    // 平均区间取前几根
+input bool   CRTNeedKeyLevel     = true;  // 被扫的必须是关键高/低点：C1 的高(低)点是前N根里最高(最低)
+input int    CRTKeyBars          = 5;     // 关键高/低点回看根数
+input bool   CRTReversalSideOnly = true;  // 只认反转方向：阳线动量被扫高→空；阴线动量被扫低→多
 
 string   PFX="JHTF_";
 string   g_used[];
@@ -138,32 +147,60 @@ void SweepUnused()
    }
 }
 
+// CRT 过滤：c1=区间K线下标，older=+1(时间序列数组)/-1(正序数组) 指向更早的K线
+bool CRTQualify(const MqlRates &r[],int c1,int older,int got,bool bear)
+{
+   double h1=r[c1].high, l1=r[c1].low, rng=h1-l1;
+   if(rng<=0) return false;
+   bool c1Bull=(r[c1].close>r[c1].open);
+   if(CRTReversalSideOnly && bear!=c1Bull) return false;
+   if(CRTNeedMomentum)
+   {
+      if(MathAbs(r[c1].close-r[c1].open)<CRTMomBodyPct*rng) return false;
+      double s=0; int m=0;
+      for(int k=1;k<=CRTAvgBars;k++) { int idx=c1+older*k; if(idx<0 || idx>=got) break; s+=r[idx].high-r[idx].low; m++; }
+      if(m>0 && rng<CRTMomRangeMult*s/m) return false;
+   }
+   if(CRTNeedKeyLevel)
+   {
+      for(int k=1;k<=CRTKeyBars;k++)
+      {
+         int idx=c1+older*k; if(idx<0 || idx>=got) break;
+         if(bear && r[idx].high>h1) return false;
+         if(!bear && r[idx].low<l1) return false;
+      }
+   }
+   return true;
+}
+
 //---------------- 画一组高周期K线 ----------------
 void DrawGroup(int gi,ENUM_TIMEFRAMES tf,int startBar,int n,int W,int G,datetime t0,int ps)
 {
    MqlRates r[]; ArraySetAsSeries(r,false);            // r[0]=最早，r[got-1]=当前进行中
-   int got=CopyRates(_Symbol,tf,0,n,r);
+   int extra=MathMax(CRTAvgBars,CRTKeyBars)+1;          // 多取几根给 CRT 动量/关键点判断用，不画
+   int got=CopyRates(_Symbol,tf,0,n+extra,r);
    if(got<=0) return;                                   // 高周期数据未就绪，下个Tick/计时器重试
+   int first=MathMax(0,got-n);                          // 第一根要画的K线
 
-   double hi=r[0].high, lo=r[0].low;
-   for(int i=1;i<got;i++) { hi=MathMax(hi,r[i].high); lo=MathMin(lo,r[i].low); }
+   double hi=r[first].high, lo=r[first].low;
+   for(int i=first+1;i<got;i++) { hi=MathMax(hi,r[i].high); lo=MathMin(lo,r[i].low); }
    double pad=(hi-lo)*0.04; if(pad<=0) pad=_Point*10;
    string tn=TFName(tf);
    int step=W+G;
-   datetime groupStart=t0+startBar*ps, groupEnd=t0+(startBar+got*step)*ps;
+   datetime groupStart=t0+startBar*ps, groupEnd=t0+(startBar+(got-first)*step)*ps;
 
    // 标题 + 倒计时
    TextObj("H"+IntegerToString(gi),groupStart,hi+pad,
            tn+(ShowCountdown?"  ⏱ "+Countdown(r[got-1].time,tf):""),TextColor,FontSize,ANCHOR_LEFT_LOWER);
 
-   for(int i=0;i<got;i++)
+   for(int i=first;i<got;i++)
    {
-      int xs=startBar+i*step;
+      int xs=startBar+(i-first)*step;
       datetime ta=t0+xs*ps, tb=t0+(xs+W)*ps, tc=t0+(xs+W/2)*ps;
       bool up=(r[i].close>=r[i].open);
       double bt=MathMax(r[i].open,r[i].close), bb=MathMin(r[i].open,r[i].close);
       if(bt-bb<_Point) bt=bb+_Point;
-      string k=IntegerToString(gi)+"_"+IntegerToString(i);
+      string k=IntegerToString(gi)+"_"+IntegerToString(i-first);
 
       LineObj("W"+k,tc,r[i].high,tc,r[i].low,WickColor,STYLE_SOLID,1);
       RectObj("B"+k,ta,bt,tb,bb,up?BullColor:BearColor,true,false);
@@ -176,6 +213,8 @@ void DrawGroup(int gi,ENUM_TIMEFRAMES tf,int startBar,int n,int W,int G,datetime
          double ph=r[i-1].high, pl=r[i-1].low, cl=r[i].close;
          bool bear=(r[i].high>ph && cl<ph && cl>pl);
          bool bull=(r[i].low<pl  && cl>pl && cl<ph);
+         if(bear && !CRTQualify(r,i-1,-1,got,true))  bear=false;
+         if(bull && !CRTQualify(r,i-1,-1,got,false)) bull=false;
          if(bear || bull)
          {
             bool live=(i==got-1);
@@ -197,7 +236,7 @@ void DrawGroup(int gi,ENUM_TIMEFRAMES tf,int startBar,int n,int W,int G,datetime
       }
 
       // FVG：第 i-2 根与第 i 根之间的缺口，只显示之后还没被完全回补的
-      if(ShowFVG && i>=2)
+      if(ShowFVG && i>=first+2)
       {
          bool bf=(r[i].low>r[i-2].high), sf=(r[i].high<r[i-2].low);
          if(bf || sf)
@@ -207,7 +246,7 @@ void DrawGroup(int gi,ENUM_TIMEFRAMES tf,int startBar,int n,int W,int G,datetime
             for(int j=i+1;j<got && !filled;j++)
                filled=(bf ? r[j].low<=bot : r[j].high>=top);
             if(!filled)
-               RectObj("F"+k,t0+(startBar+(i-1)*step)*ps,top,groupEnd,bot,bf?C'20,70,60':C'85,30,35',true,true);
+               RectObj("F"+k,t0+(startBar+(i-1-first)*step)*ps,top,groupEnd,bot,bf?C'20,70,60':C'85,30,35',true,true);
          }
       }
    }
