@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Jammy"
 #property version   "1.50"
-#property description "Jammy ICT Suite v1.53：SMT / 结构(BOS·CHoCH) / FVG / OB / 流动性 / 折价溢价·OTE / Killzone / CRT"
+#property description "Jammy ICT Suite v1.54：SMT / 结构(BOS·CHoCH) / FVG / OB / 流动性 / 折价溢价·OTE / Killzone / CRT"
 #property indicator_chart_window
 #property indicator_buffers 0
 #property indicator_plots   0
@@ -82,8 +82,12 @@ input bool   CRTNeedMomentum     = true;  // C1 必须是动量K线（实体大�
 input double CRTMomBodyPct       = 0.55;  // 动量：C1 实体 ≥ C1 区间 × 此比例
 input double CRTMomRangeMult     = 1.2;   // 动量：C1 区间 ≥ 前N根平均区间 × 此倍数
 input int    CRTAvgBars          = 10;    // 平均区间取前几根
-input bool   CRTNeedKeyLevel     = true;  // 被扫的必须是关键高/低点：C1 的高(低)点是前N根里最高(最低)
-input int    CRTKeyBars          = 5;     // 关键高/低点回看根数
+input bool   CRTNeedKeyLevel     = true;  // C2 必须扫进关键区域（以下勾选的任一满足即可）
+input bool   CRTKeyPrevHL        = true;  // 关键区域①：前高/前低（C2 扫过 C1 之前N根的最高/最低点）
+input int    CRTKeyBars          = 5;     // 前高/前低回看根数
+input bool   CRTKeyFVG           = true;  // 关键区域②：C2 影线打进未回补的反向 FVG（空=看跌FVG，多=看涨FVG）
+input bool   CRTKeyOB            = true;  // 关键区域③：C2 影线打进未失效的反向 OB（空=看跌OB，多=看涨OB）
+input int    CRTZoneBars         = 30;    // FVG/OB 往回找几根
 input bool   CRTReversalSideOnly = true;  // 只认反转方向：阳线动量被扫高→空；阴线动量被扫低→多
 input int    CRTMaxBars          = 6;     // 确认后最多等几根K线到达目标，超出算失败
 input bool   CRTTargetFullRange  = true;  // 目标：true=C1区间另一端，false=C1区间50%
@@ -551,9 +555,60 @@ int CRTOutcome(const MqlRates &r[],int c2,int newer,int got,bool bear,double tar
    return 0;
 }
 
-// CRT 过滤：c1=区间K线下标，older=+1(时间序列数组)/-1(正序数组) 指向更早的K线
-bool CRTQualify(const MqlRates &r[],int c1,int older,int got,bool bear)
+// 关键区域：从 zc 的下一根（更新）到 C1，区域没有被回补/突破
+bool ZoneAlive(const MqlRates &r[],int zc,int older,int c1,bool bear,double top,double bot,bool isOB)
 {
+   for(int idx=zc-older;;idx-=older)
+   {
+      if(bear) { if(isOB ? r[idx].close>top : r[idx].high>=top) return false; }
+      else     { if(isOB ? r[idx].close<bot : r[idx].low<=bot)  return false; }
+      if(idx==c1) break;
+   }
+   return true;
+}
+
+// C2 是否扫进关键区域：前高/前低、反向 FVG、反向 OB（都取 C1 之前的K线），tag 返回命中的类型
+bool CRTKeyZone(const MqlRates &r[],int c1,int older,int got,bool bear,string &tag)
+{
+   tag="";
+   int c2=c1-older;
+   double h2=r[c2].high, l2=r[c2].low;
+   if(CRTKeyPrevHL)
+   {
+      double ext=(bear?-DBL_MAX:DBL_MAX); int m=0;
+      for(int k=1;k<=CRTKeyBars;k++)
+      {
+         int idx=c1+older*k; if(idx<0 || idx>=got) break;
+         ext=(bear?MathMax(ext,r[idx].high):MathMin(ext,r[idx].low)); m++;
+      }
+      if(m>0 && (bear ? h2>ext : l2<ext)) { tag=(bear?"前高":"前低"); return true; }
+   }
+   for(int k=1;k<=CRTZoneBars;k++)
+   {
+      int c=c1+older*k, b=c1+older*(k+1), a=c1+older*(k+2);   // a最早 → c最新，都在 C1 之前
+      if(a<0 || a>=got) break;
+      if(CRTKeyFVG)
+      {
+         double top=0,bot=0; bool ok=false;
+         if(bear && r[a].low>r[c].high)  { top=r[a].low; bot=r[c].high; ok=true; }   // 看跌 FVG
+         if(!bear && r[a].high<r[c].low) { top=r[c].low; bot=r[a].high; ok=true; }   // 看涨 FVG
+         if(ok && h2>=bot && l2<=top && ZoneAlive(r,c,older,c1,bear,top,bot,false)) { tag="FVG"; return true; }
+      }
+      if(CRTKeyOB)
+      {
+         bool ob=false; double top=r[b].high, bot=r[b].low;
+         if(bear && r[b].close>r[b].open && r[c].close<r[b].low)  ob=true;   // 看跌OB：阳线后被阴线收破低点
+         if(!bear && r[b].close<r[b].open && r[c].close>r[b].high) ob=true;  // 看涨OB：阴线后被阳线收破高点
+         if(ob && h2>=bot && l2<=top && ZoneAlive(r,c,older,c1,bear,top,bot,true)) { tag="OB"; return true; }
+      }
+   }
+   return false;
+}
+
+// CRT 过滤：c1=区间K线下标，older=+1(时间序列数组)/-1(正序数组) 指向更早的K线
+bool CRTQualify(const MqlRates &r[],int c1,int older,int got,bool bear,string &tag)
+{
+   tag="";
    double h1=r[c1].high, l1=r[c1].low, rng=h1-l1;
    if(rng<=0) return false;
    bool c1Bull=(r[c1].close>r[c1].open);
@@ -565,15 +620,7 @@ bool CRTQualify(const MqlRates &r[],int c1,int older,int got,bool bear)
       for(int k=1;k<=CRTAvgBars;k++) { int idx=c1+older*k; if(idx<0 || idx>=got) break; s+=r[idx].high-r[idx].low; m++; }
       if(m>0 && rng<CRTMomRangeMult*s/m) return false;
    }
-   if(CRTNeedKeyLevel)
-   {
-      for(int k=1;k<=CRTKeyBars;k++)
-      {
-         int idx=c1+older*k; if(idx<0 || idx>=got) break;
-         if(bear && r[idx].high>h1) return false;
-         if(!bear && r[idx].low<l1) return false;
-      }
-   }
+   if(CRTNeedKeyLevel && !CRTKeyZone(r,c1,older,got,bear,tag)) return false;
    return true;
 }
 
@@ -583,7 +630,7 @@ void CRT()
    if(!ShowCRT || PeriodSeconds(CRT_TF)<=PeriodSeconds()) { if(ShowCRT) g_crtText="CRT 需高于当前周期"; return; }
    MqlRates r[]; ArraySetAsSeries(r,true);
    int look=MathMax(CRTLookback,CRTMaxBars+1);          // 至少回看到能判出成败
-   int got=CopyRates(_Symbol,CRT_TF,0,look+2+MathMax(CRTAvgBars,CRTKeyBars),r);
+   int got=CopyRates(_Symbol,CRT_TF,0,look+4+MathMax(MathMax(CRTAvgBars,CRTKeyBars),CRTZoneBars),r);
    if(got<3) return;
 
    for(int j=MathMin(look,got-2);j>=0;j--)
@@ -600,8 +647,10 @@ void CRT()
 
       bool bear=(r[j].high>h1 && c2close<h1 && c2close>l1);   // 扫高点收回 → 目标区间低点
       bool bull=(r[j].low<l1  && c2close>l1 && c2close<h1);   // 扫低点收回 → 目标区间高点
-      if(bear && !CRTQualify(r,j+1,1,got,true))  bear=false;
-      if(bull && !CRTQualify(r,j+1,1,got,false)) bull=false;
+      string tagS="",tagB="";
+      if(bear && !CRTQualify(r,j+1,1,got,true,tagS))  bear=false;
+      if(bull && !CRTQualify(r,j+1,1,got,false,tagB)) bull=false;
+      string ktag=(bear?tagS:tagB);
       if(!bear && !bull) continue;
 
       string id=IntegerToString((long)t1);
@@ -622,7 +671,7 @@ void CRT()
       Rect("CRT"+id,t1,h1,t2,l1,c,false,STYLE_SOLID);
       Seg("CRTm"+id,t1,mid,t2,mid,c,STYLE_DOT);
       Seg("CRTg"+id,t2,target,wEnd,target,c,STYLE_DASH);   // 目标线画到 N 根窗口结束
-      string label=StringFormat("CRT%s｜目标 %s｜%s",bear?"空":"多",DoubleToString(target,_Digits),st);
+      string label=StringFormat("CRT%s%s｜目标 %s｜%s",bear?"空":"多",ktag!=""?"["+ktag+"]":"",DoubleToString(target,_Digits),st);
       Txt("CRTt"+id,t1,bear?h1:l1,label,c,8,bear?ANCHOR_LEFT_LOWER:ANCHOR_LEFT_UPPER);
       if(res==0 && j<=CRTMaxBars)
       {
