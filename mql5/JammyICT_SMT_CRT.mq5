@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Jammy"
 #property version   "1.50"
-#property description "Jammy ICT Suite v1.50：SMT / 结构(BOS·CHoCH) / FVG / OB / 流动性 / 折价溢价·OTE / Killzone / CRT"
+#property description "Jammy ICT Suite v1.51：SMT / 结构(BOS·CHoCH) / FVG / OB / 流动性 / 折价溢价·OTE / Killzone / CRT"
 #property indicator_chart_window
 #property indicator_buffers 0
 #property indicator_plots   0
@@ -371,7 +371,7 @@ void FVG()
 //+------------------------------------------------------------------+
 //| 流动性：等高 / 等低                                                |
 //+------------------------------------------------------------------+
-// v1.50：只显示“还没被扫掉”的流动性池：
+// v1.51：只显示“还没被扫掉”的流动性池：
 // 波段高点之后任何一根已收盘K线的最高价越过它 = 已被扫，不再显示（低点同理）。
 bool PoolSwept(int idx,double level,bool high)
 {
@@ -484,12 +484,18 @@ void Killzones()
    if(PeriodSeconds()>PeriodSeconds(PERIOD_H1)) return;   // 只在 H1 及以下显示
    datetime nyNow=ToNY(T[0]);
    datetime nyToday=DayStart(nyNow);
-   for(int d=0;d<MathMax(1,KillzoneDays);d++)
+   // d=-1：明天的亚洲盘从今天纽约 20:00 就开始了（北京时间早上），需要提前画出
+   for(int d=-1;d<MathMax(1,KillzoneDays);d++)
    {
       datetime day=nyToday-d*86400;
       int dow=DayOfWeek(day);
       if(dow==0 || dow==6) continue;
       string id=IntegerToString((long)day);
+      if(d<0)
+      {
+         if(ShowKillzones) KillzoneBox("A"+id,day-86400,20,0,0,0,clrMediumPurple,"亚洲");
+         continue;
+      }
       if(ShowKillzones)
       {
          KillzoneBox("A"+id,day-86400,20,0,0,0,clrMediumPurple,"亚洲");
